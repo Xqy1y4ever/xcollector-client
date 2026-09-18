@@ -26,7 +26,13 @@ import re
 import sys
 from pathlib import Path
 
-from app.config import BASE_DIR, ConfigError, Settings
+from app.config import (
+    BASE_DIR,
+    REMOVED_ENV_KEYS,
+    ConfigError,
+    Settings,
+    stale_env_keys,
+)
 from tests._hermetic import isolate_settings
 
 # 下面那些 "默认值" 断言要真的从默认值出发 —— 本机那份 .env（真令牌、真白名单、
@@ -35,21 +41,19 @@ isolate_settings()
 
 APP_DIR = BASE_DIR / "app"
 ENV_EXAMPLE = BASE_DIR / ".env.example"
+# 临时文件放仓库里（`.tmp-test/`，已 gitignore），不用系统 temp —— 文件沙箱下
+# 系统 temp 在清理阶段会被拒绝 chmod，那会让一个全通过的测试以看不懂的错误收场。
+SCRATCH = BASE_DIR / ".tmp-test"
 
 # 只通过命令行开关设置、**故意不写进 .env.example** 的字段。
 # 写进去会误导：这两个是 `--dry-run` / `--since-hours` 的行为开关，
 # 放到配置文件里等于鼓励用户长期开着"试跑模式"。
 CLI_ONLY_FIELDS = {"client_dry_run", "client_force_recheck"}
 
-# 已经从配置里删掉、且不允许再被引用的键（留着会让人以为它还生效）
-REMOVED_KEYS = (
-    "CLIENT_CURSOR_NAMESPACE",
-    "CLIENT_CURSOR_KEY",
-    "WEB_API_TOKEN",
-    # 以前"首次运行往回看多少小时"—— 现在读什么由**镜像里的已读标记**决定，
-    # 时间窗口不再决定选取范围（见 app/source/ntmsg.py 的说明）。
-    "CLIENT_INITIAL_LOOKBACK_HOURS",
-)
+# 已经从配置里删掉、且不允许再被引用的键（留着会让人以为它还生效）。
+# 名单本身是**运行时也要用的**（`app/config.stale_env_keys()` 在启动时警告一次），
+# 所以这里从 app 里读，而不是各写一份 —— 两份名单迟早会漂移。
+REMOVED_KEYS = tuple(REMOVED_ENV_KEYS)
 
 fails: list[str] = []
 total = 0
@@ -131,17 +135,58 @@ def main() -> int:  # noqa: C901
 
     # ------------------------------------------------------------------
     print("\n--- 3. 已经删掉的旧配置不许再被引用 ---")
-    code_text = "\n".join(strip_comments(t) for t in sources.values())
-    env_text = ENV_EXAMPLE.read_text(encoding="utf-8")
+    # **只认 `KEY=...` 那种生效的行**：注释里写"这个键已经作废、请删掉那一行"是好文档，
+    # 不是残留配置（一刀切按子串查会把这段说明判成 bug）。
+    example_keys = env_keys()
+    # config.py 里那份失效键名单是**故意**写出来的（启动时要靠它警告用户），所以
+    # "不许再被引用"只对其余文件成立。名单本身在这里被当作唯一事实来源来读。
+    other_sources = {
+        name: strip_comments(text) for name, text in sources.items() if name != "config.py"
+    }
+    other_text = "\n".join(other_sources.values()).lower()
     for key in REMOVED_KEYS:
-        check_true(f"{key} 不在 .env.example 里", key not in env_text, key)
+        check_true(f"{key} 不在 .env.example 里（注释里提到不算）", key not in example_keys, key)
         check_true(f"{key} 不是 Settings 字段", key.lower() not in field_set, key)
-        check_true(
-            f"{key} 在 app/ 的代码里已无引用",
-            key.lower() not in code_text.lower(),
-            key,
-        )
+    check(
+        "除了 config.py 里的失效键名单，app/ 里没有别的地方还引用它们",
+        sorted({k for k in REMOVED_KEYS if k.lower() in other_text}),
+        [],
+    )
+    check_true(
+        "每个失效键都写了「现在该用什么」（否则警告等于没说）",
+        all(v.strip() for v in REMOVED_ENV_KEYS.values()),
+        str(REMOVED_ENV_KEYS),
+    )
     check_true("也没有残留的 cursor 配置字段", not any("cursor" in f for f in fields), str(fields))
+
+    # ------------------------------------------------------------------
+    print("\n--- 3b. 用户 .env 里留着失效键要能看出来 ---")
+    # 这一步守的是 `extra="ignore"` 的另一面：淘汰的键不会让程序起不来，但也不会
+    # 生效 —— 于是"我明明配了"和"这个键根本没用"长得一模一样。启动时靠这个函数出声。
+    stale_file = SCRATCH / "stale.env"
+    SCRATCH.mkdir(parents=True, exist_ok=True)
+    stale_file.write_text(
+        "# 注释里的键不算\n"
+        "\n"
+        "CLIENT_DB_PATH=/data/nt_msg_export.db\n"
+        "CLIENT_INITIAL_LOOKBACK_HOURS=720\n"
+        "  client_cursor_key = abc  \n"
+        "不是键值行\n",
+        encoding="utf-8",
+    )
+    stale = stale_env_keys(stale_file)
+    check(
+        "认出了失效的键（且只有它们）",
+        sorted(k for k, _ in stale),
+        ["CLIENT_CURSOR_KEY", "CLIENT_INITIAL_LOOKBACK_HOURS"],
+    )
+    check_true(
+        "并且说清了现在该用什么",
+        all(instead.strip() for _, instead in stale),
+        str(stale),
+    )
+    check("文件不存在 → 空表（不是报错）", stale_env_keys(SCRATCH / "nope.env"), [])
+    check("env_file 被关掉（测试隔离）时不去读磁盘", stale_env_keys(), [])
 
     # ------------------------------------------------------------------
     print("\n--- 4. 字段名 = 环境变量名的小写（pydantic 的硬规则）---")

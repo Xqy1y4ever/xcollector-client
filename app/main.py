@@ -20,7 +20,7 @@ import logging
 import sys
 
 from .backend_client import BackendClient, BackendError
-from .config import ConfigError, get_settings
+from .config import ConfigError, get_settings, stale_env_keys
 from .logging_setup import setup_logging
 from .run import (
     load_processed_raw_ids,
@@ -318,6 +318,15 @@ async def amain(args: argparse.Namespace) -> int:
     except ConfigError as exc:
         logger.error("配置有问题：%s", exc)
         return 2
+
+    # `.env` 里留着已经失效的键时**必须出声**：`extra="ignore"` 让它们静悄悄地
+    # 什么都不做，于是"我配了"和"根本没生效"长得一模一样。
+    for key, instead in stale_env_keys():
+        logger.warning(
+            ".env 里的 %s 已经失效（不影响启动，但配了等于没配）：%s。可以直接删掉这一行。",
+            key,
+            instead,
+        )
 
     db = SourceDatabase(settings.ntmsg_export_path)
     backend = BackendClient(settings)

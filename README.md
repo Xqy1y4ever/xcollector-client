@@ -82,6 +82,9 @@ BACKEND_BASE_URL=http://127.0.0.1:8000
 | `CLIENT_DECRYPT_TABLES` | 空 = 全部 | 只解密需要的表（如 `group_msg_table,c2c_msg_table`）会快一些 |
 | `CLIENT_DECRYPT_MAX_SKIPS` | `-1` | 允许多少行因坏页被跳过。每次跳过都会打 ERROR 日志 |
 
+> 从旧版本升级：`CLIENT_INITIAL_LOOKBACK_HOURS` 已经作废（读什么改由镜像里的已读标记
+> 决定）。`.env` 里留着它不会报错，但启动时会在日志里警告一次 —— 可以直接删掉那一行。
+
 ### 怎么拿到密钥
 
 密钥是 NTQQ 解密那个库用的 **16 个 ASCII 字符**，只在进程内存里，磁盘上没有。

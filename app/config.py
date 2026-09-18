@@ -433,3 +433,49 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+# 以前存在、现在**已经没有任何作用**的键，连同"现在该用什么"。
+#
+# 为什么要在启动时专门查一遍：`extra="ignore"` 意味着用户 `.env` 里留着一个淘汰的键
+# 不会报错 —— 于是"我明明配了"和"这个键根本不生效"长得一模一样。客户端的判据从
+# 时间窗口换成"镜像里的已读标记"时，一台已经跑着的机器上正好留着旧键，这就是一个
+# 现成的例子。
+REMOVED_ENV_KEYS: dict[str, str] = {
+    "CLIENT_INITIAL_LOOKBACK_HOURS": (
+        "读哪些消息现在由镜像里的已读标记决定（不看时间）；"
+        "时间窗口只剩 CLIENT_RECHECK_OVERLAP_HOURS 这个回看窗口"
+    ),
+    "CLIENT_CURSOR_NAMESPACE": "后端游标已被镜像库取代（CLIENT_MIRROR_PATH）",
+    "CLIENT_CURSOR_KEY": "后端游标已被镜像库取代（CLIENT_MIRROR_PATH）",
+    "WEB_API_TOKEN": "网页端不再用单独的令牌；客户端用 CLIENT_TOKEN",
+}
+
+
+def stale_env_keys(env_file: Path | str | None = None) -> list[tuple[str, str]]:
+    """`(键, 现在该用什么)` —— `.env` 里那些已经失效的配置。
+
+    `env_file` 不传就用 `Settings` 配的那个（也就是 `BASE_DIR/.env`）；测试会传一个
+    临时文件进来。文件不存在、或者 `env_file` 被显式关掉（测试里的隔离）都返回空表。
+
+    只报 `REMOVED_ENV_KEYS` 里那些**确定失效**的键，不报"不认识的键"：`.env` 里放
+    别的工具（Docker 的宿主目录变量之类）用的东西是合理的，报出来只会制造噪音。
+    """
+    if env_file is None:
+        configured = Settings.model_config.get("env_file")
+        if not configured:
+            return []
+        env_file = Path(str(configured))
+    path = Path(env_file)
+    if not path.exists():
+        return []
+    out: list[tuple[str, str]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key = line.split("=", 1)[0].strip().upper()
+        if key in REMOVED_ENV_KEYS:
+            out.append((key, REMOVED_ENV_KEYS[key]))
+    return out
+
