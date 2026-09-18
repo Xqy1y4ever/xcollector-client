@@ -45,12 +45,12 @@ from app.ntmsg_db import (  # noqa: E402
     watermark,
 )
 from app.ntmsg_db.prepare import prepare_databases, read_key, resolve_paths  # noqa: E402
-from app.ntmsg_db.sqlite_uri import sqlite_uri  # noqa: E402
 from app.source.ntmsg import (  # noqa: E402
     SourceDatabase,
     attachments_from_content,
     quote_ref_from_content,
 )
+from app.utils import sqlite_uri  # noqa: E402
 from msgdb.proto import c2c_40800_pb2 as pb  # noqa: E402
 from msgdb.proto.c2c_40800_parser import parse_40800  # noqa: E402
 
@@ -688,6 +688,10 @@ def test_reader() -> None:
 def test_prepare() -> None:
     section("prepare：按文件时间决定要不要重跑")
     from app.config import Settings
+    from tests._hermetic import isolate_settings
+
+    # 这个文件不读任何环境变量；本机 `.env` 里的 CLIENT_EXPORT_* 会改变 prepare 的行为。
+    isolate_settings()
 
     fixture = Fixture(WORK / "prep", rows=4)
     settings = Settings(

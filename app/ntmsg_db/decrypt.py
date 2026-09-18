@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
-from .sqlite_uri import sqlite_uri
+from ..utils import sqlite_uri
 
 logger = logging.getLogger(__name__)
 

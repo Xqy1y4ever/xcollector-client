@@ -100,6 +100,10 @@ class CycleReport:
     errors: list[str] = field(default_factory=list)
     # 这一轮的"解密 + 导出"做了什么（没配 CLIENT_NT_MSG_DB 时是 None）
     prepared: str | None = None
+    # 轮开始/结束时源库里还有多少条没读过（判据是镜像，不是时间）
+    unread_before: int = 0
+    # 其中有多少条属于"回看已读消息、检查内容有没有被编辑"的那一趟（2b）
+    rechecked: int = 0
     mirror_before: dict = field(default_factory=dict)
     mirror_after: dict = field(default_factory=dict)
     latest_in_db: tuple[int, str] | None = None
@@ -441,12 +445,13 @@ async def run_cycle(
         # 而不是让用户看到一堆没有解释的失败。
         #
         # ⚠️ 而且**一条都不扫、镜像也不动**。先启动客户端、再去网页上订阅是很自然的
-        # 顺序；这里要是照常扫完并把消息都标成处理过，那 72 小时的回看窗口就被这次
-        # "什么都不做"的运行白白烧掉了。留着不动，等订阅配好之后下一轮自然补上。
+        # 顺序；这里要是照常扫完并把消息都标成处理过，那批存量就被这次"什么都不做"
+        # 的运行白白烧掉了（现在不再有时间窗口兜着，烧掉就是真的没了）。
+        # 留着不动，等订阅配好之后下一轮自然补上。
         logger.warning(
             "这个用户还没有订阅任何来源，所以这一轮什么都不做（镜像也没动）。"
             "请先在网页上（或给机器人发 /订阅）订一个 (群, 发送者)，"
-            "下一轮就会把 CLIENT_INITIAL_LOOKBACK_HOURS 之内的存量补上。"
+            "下一轮就会把源库里没读过的存量补上。"
         )
         report.errors.append("还没有订阅任何来源，本轮未做任何事（镜像未动）")
         return report
@@ -491,6 +496,11 @@ async def run_cycle(
     batch_limit = min(settings.client_batch_size, settings.client_max_messages_per_cycle)
     budget = batch_limit
 
+    # 这一轮**已经看过**的 msg_id。回看（2b）的窗口与"没读过"是并集，刚在 2a 处理过的
+    # 消息自然也在窗口里；不排掉就会在一轮里把同一份内容处理两遍（dry-run 下是白花一次
+    # 抽取），`scanned` 也会虚高。
+    seen_this_cycle: set[str] = set()
+
     # ---- 1) 先把没做完的做完（崩溃恢复 + 失败重试）----
     # dry-run 下跳过这一步：它的目的是"看看会抽出什么"，不是把积压清掉。
     pending = [] if dry else store.unfinished()
@@ -507,6 +517,7 @@ async def run_cycle(
                 continue
             report.scanned += 1
             report.recovered += 1
+            seen_this_cycle.add(str(message.msg_id))
             outcome = await _handle_one(
                 message, backend, settings, attachment_resolver, store, database,
                 known_raw_ids, report, subscriptions,
@@ -516,33 +527,48 @@ async def run_cycle(
             if budget <= 0:
                 break
 
-    # ---- 2) 增量扫描 ----
-    # 起点 = 水位线 - 回看窗口。回看窗口同时覆盖两种"旧消息也要重看"的情况：
-    # 同一秒里后到的、以及内容被编辑过的。
-    watermark = store.watermark()
-    overlap_ms = int(settings.client_recheck_overlap_hours * 3600 * 1000)
-    if watermark:
-        since_ts = max(0, watermark - overlap_ms // 1000)
-    else:
-        since_ts = (moment - settings.client_initial_lookback_hours * 3600 * 1000) // 1000
+    # ---- 2) 扫"没读过"的消息 ----
+    #
+    # 判据是**镜像**（= 已读标记），不是时间：源库里凡是镜像里没有的都要读，
+    # 不管它多老。时间窗口表达不了"这条处理过没有"，会让"比窗口更老、而镜像里又
+    # 没有"的消息（换过导出库、镜像被删过、白名单刚放开、导出曾经漏了一批）永远
+    # 读不到 —— 而那正是这套系统最怕的"静默漏掉通知"。
+    #
+    # 时间窗口只剩一个用途：**回看最近一段已读消息**，看内容有没有被编辑过（2b）。
+    unread_before = database.count_unread(store.path)
+    report.unread_before = unread_before
+    if unread_before:
         logger.info(
-            "镜像里还没有处理过的消息，从 %d 小时前开始扫（源库时间戳是**秒**）",
-            settings.client_initial_lookback_hours,
+            "源库里还有 %s 条没读过的消息（本轮最多处理 %d 条）—— 判据是镜像里的"
+            "已读标记，不看时间；处理完就记下，下一轮不再重复读。",
+            f"{unread_before:,}",
+            max(0, budget),
         )
+    else:
+        logger.debug("源库里没有没读过的消息")
 
     latest = database.latest()
     report.latest_in_db = latest
-    if latest is not None and since_ts > latest[0]:
+    mirror_watermark = store.watermark()
+    if latest is not None and mirror_watermark and latest[0] < mirror_watermark:
         logger.warning(
-            "扫描起点(%s)比源库最新消息(%s)还新：源库可能被换成了更旧的快照。"
-            "如果确实换了库，把镜像文件删掉或换一个 CLIENT_MIRROR_PATH 重来。",
-            since_ts,
+            "源库最新消息(%s)比镜像里已处理过的最新消息(%s)还旧：源库可能被换成了"
+            "更旧的快照（或导出倒退了）。如果确实换了库，把镜像文件删掉、或换一个"
+            "CLIENT_MIRROR_PATH 重来 —— 否则「哪些处理过」的判断全是错的。",
             latest[0],
+            mirror_watermark,
         )
 
     stats: dict[str, int] = {}
-    for message in database.iter_since(since_ts, "", limit=max(0, budget)):
+
+    async def handle_scanned(message: SourceMessage) -> None:
+        """扫到一条消息之后的所有动作（dry-run 的分支也在里面）。
+
+        抽成函数是因为它现在被两个扫描用：2a（没读过的）和 2b（回看已读的）。
+        """
+        nonlocal stats
         report.scanned += 1
+        seen_this_cycle.add(str(message.msg_id))
         # dry-run：不 claim、不记账，只走一遍抽取看看会得到什么。
         # （claim 会往镜像里插 pending 行，虽然无害，但"试跑"不该改动任何状态。）
         if dry:
@@ -555,16 +581,16 @@ async def run_cycle(
                 logger.exception("处理消息失败 msg_id=%s", message.msg_id)
                 report.errors.append(f"msg_id={message.msg_id}: {type(exc).__name__}: {exc}")
                 _add(stats, OUTCOME_ERROR)
-                continue
+                return
             report.processed += 1
             _accumulate(report, outcome)
-            continue
+            return
 
         row, what = store.claim(message)
         if what == "unchanged":
             report.unchanged += 1
             _add(stats, OUTCOME_UNCHANGED)
-            continue
+            return
         if what == "changed":
             logger.info(
                 "内容变了，重新处理 msg_id=%s（后端幂等会把原来那条任务更新掉）", message.msg_id
@@ -582,7 +608,7 @@ async def run_cycle(
             store.finish(message.msg_id, state=STATE_FAILED, error=f"{type(exc).__name__}: {exc}")
             report.errors.append(f"msg_id={message.msg_id}: {type(exc).__name__}: {exc}")
             _add(stats, OUTCOME_ERROR)
-            continue
+            return
 
         report.processed += 1
         _accumulate(report, outcome)
@@ -610,7 +636,36 @@ async def run_cycle(
             except BackendError as exc:
                 logger.warning("写群状态失败 group=%s：%s", message.group_id, exc)
 
-    report.outcomes = dict(report.outcomes)
+    # ---- 2a) 没读过的：按时间正序 ----
+    # 从**最老的**未读开始：补充关系里"原文"必须先于"补充"被处理，否则补充找不到
+    # 目标、会被当成一条独立的新消息。
+    for message in database.iter_unread(store.path, limit=max(0, budget)):
+        await handle_scanned(message)
+        budget -= 1
+        if budget <= 0:
+            break
+
+    # ---- 2b) 回看：最近一段**已读**消息的内容有没有变 ----
+    # 这是"消息被编辑过"唯一的发现途径（内容指纹在 mirror.claim 里比）。
+    # 只回看最近 `CLIENT_RECHECK_OVERLAP_HOURS` 小时，而且是**最新优先**：
+    # 窗口比预算大时，先看最新的那一段，否则老消息会把预算吃光、新改动永远排不上。
+    # 排除掉这一轮已经看过的那批（`seen_this_cycle`）—— 同一份内容一轮处理两遍没有
+    # 任何意义，dry-run 下还要白花一次抽取。
+    if budget > 0 and latest is not None and settings.client_recheck_overlap_hours > 0:
+        recheck_since = max(0, int(latest[0]) - int(settings.client_recheck_overlap_hours * 3600))
+        if recheck_since > 0:
+            for message in database.iter_unread(
+                store.path,
+                limit=budget,
+                recheck_since=recheck_since,
+                exclude=seen_this_cycle,
+            ):
+                report.rechecked += 1
+                await handle_scanned(message)
+                budget -= 1
+                if budget <= 0:
+                    break
+
 
     if not settings.client_dry_run and stats:
         try:
@@ -648,16 +703,24 @@ def _merge(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
 def log_report(report: CycleReport) -> None:
     """把一次循环的结果打成一行（+ 出错时的明细）。"""
     logger.info(
-        "本轮：扫了 %d 条（恢复 %d），跳过 %d 条没变的、%d 条订阅外的、%d 条白名单外的，"
-        "更新了 %d 条任务，结果=%s",
+        "本轮：扫了 %d 条（恢复 %d，其中回看已读的 %d），跳过 %d 条没变的、%d 条订阅外的、"
+        "%d 条白名单外的，更新了 %d 条任务，结果=%s",
         report.scanned,
         report.recovered,
+        report.rechecked,
         report.unchanged,
         report.skipped_unsubscribed,
         report.skipped_whitelist,
         report.amended,
         report.outcomes or {},
     )
+    if report.unread_before and report.unread_before > report.scanned:
+        logger.info(
+            "源库里还剩 %s 条没读过（本轮处理了 %d 条，下一轮接着读）—— "
+            "第一轮会把库里所有群消息过一遍，之后每轮只读新的。",
+            f"{report.unread_before - report.scanned:,}",
+            report.scanned,
+        )
     if report.prepared:
         logger.info("源库准备：%s", report.prepared)
     if report.mirror_after:

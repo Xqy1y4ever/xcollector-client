@@ -27,6 +27,11 @@ from pathlib import Path
 from app.config import ConfigError, Settings, parse_id_name_pairs
 from app.mirror import STATE_PENDING, STATE_SKIPPED, Mirror
 from app.source.ntmsg import SourceMessage
+from tests._hermetic import isolate_settings
+
+# "一个号码都不配 → 放行"必须真的从一个空的 Settings 出发：本机那份 .env 里
+# 有真实白名单，不清掉的话这一组断言会以看不懂的方式失败。
+isolate_settings()
 
 SCRATCH = Path(__file__).resolve().parent.parent / ".tmp-test"
 

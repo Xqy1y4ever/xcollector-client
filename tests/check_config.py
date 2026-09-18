@@ -27,6 +27,11 @@ import sys
 from pathlib import Path
 
 from app.config import BASE_DIR, ConfigError, Settings
+from tests._hermetic import isolate_settings
+
+# 下面那些 "默认值" 断言要真的从默认值出发 —— 本机那份 .env（真令牌、真白名单、
+# 真导出库路径）必须先摘掉，否则测的是这台机器的配置，不是代码。
+isolate_settings()
 
 APP_DIR = BASE_DIR / "app"
 ENV_EXAMPLE = BASE_DIR / ".env.example"
@@ -37,7 +42,14 @@ ENV_EXAMPLE = BASE_DIR / ".env.example"
 CLI_ONLY_FIELDS = {"client_dry_run", "client_force_recheck"}
 
 # 已经从配置里删掉、且不允许再被引用的键（留着会让人以为它还生效）
-REMOVED_KEYS = ("CLIENT_CURSOR_NAMESPACE", "CLIENT_CURSOR_KEY", "WEB_API_TOKEN")
+REMOVED_KEYS = (
+    "CLIENT_CURSOR_NAMESPACE",
+    "CLIENT_CURSOR_KEY",
+    "WEB_API_TOKEN",
+    # 以前"首次运行往回看多少小时"—— 现在读什么由**镜像里的已读标记**决定，
+    # 时间窗口不再决定选取范围（见 app/source/ntmsg.py 的说明）。
+    "CLIENT_INITIAL_LOOKBACK_HOURS",
+)
 
 fails: list[str] = []
 total = 0

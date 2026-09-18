@@ -39,10 +39,16 @@ from app.mirror import STATE_DONE, STATE_SKIPPED, Mirror
 from app.run import run_cycle, verify_identity
 from app.source.attachments import AttachmentResolver
 from app.source.ntmsg import SourceDatabase
+from tests._hermetic import isolate_settings
 
 BASE = os.environ.get("CLIENT_BASE", "http://127.0.0.1:8005").rstrip("/")
 API = BASE + "/api"
 SERVICE = os.environ.get("CLIENT_SERVICE_TOKEN", "service-token")
+
+# 环境变量**留着**（后端地址与令牌就是从上面两行读的），但本机那份 `.env` 必须摘掉：
+# 它里面是真实的白名单和导出库路径，会让 `make_settings` 没显式传的字段悄悄变成真配置
+# —— 第 3 节就是这样被本机白名单挡掉的（报错只是 outcomes.get("extracted") = None）。
+isolate_settings(clear_env=False)
 
 RUN = os.environ.get("CLIENT_RUN") or str(int(time.time() * 1000))
 QQ = str(500000000 + int(RUN[-7:]) % 40000000)
@@ -194,9 +200,12 @@ def make_settings(token: str, db_path: Path, **overrides) -> Settings:
         client_db_path=str(db_path),
         client_mirror_path=str(SCRATCH / f"mirror-{RUN}.db"),
         client_extractor="rule",          # 核心链路不联网、不花钱
-        client_initial_lookback_hours=72,
         client_batch_size=100,
         client_max_messages_per_cycle=100,
+        # 白名单显式留空：不写这两行的话，本机 `.env` 里的真白名单会生效，
+        # 所有"应该被抽出来"的断言都会以一种看不懂的方式失败。
+        client_group_whitelist="",
+        client_sender_whitelist="",
         client_poll_seconds=1,
         client_attachment_root="",
         client_missing_attachment="url",
@@ -583,6 +592,44 @@ async def run_all() -> int:  # noqa: C901
                 await backend10.close()
         finally:
             await backend9.close()
+
+        # ----------------------------------------------------------------
+        print("\n--- 16. 判据是「没读过」，不是时间：很老的消息照样要读 ---")
+        # 这条是这一版的**核心回归**：源库里放一条 20 天前的消息（远远超出任何
+        # 时间窗口，也超出 CLIENT_RECHECK_OVERLAP_HOURS），而镜像里没有它 ——
+        # 它必须被读到。以前按"水位线 - 回看窗口"扫的时候，这条永远不会被读。
+        db_old = SCRATCH / f"e2e-old-{RUN}.db"
+        mirror_old_path = SCRATCH / f"mirror-old-{RUN}.db"
+        old_ts = BASE_TS - 20 * 24 * 3600
+        make_source_db(db_old, [
+            {"msg_id": "900", "ts": old_ts, "text": "下周三前交材料",
+             "content": text_of("下周三前交材料")},
+            {"msg_id": "901", "ts": BASE_TS, "text": "下周三前交材料（新的那条）",
+             "content": text_of("下周三前交材料（新的那条）")},
+        ])
+        settings_old = make_settings(token, db_old, client_mirror_path=str(mirror_old_path))
+        backend_old = BackendClient(settings_old)
+        mirror_old = Mirror(mirror_old_path)
+        try:
+            before = len(notifications(token))
+            report = await run_cycle(
+                backend_old, settings_old, db=SourceDatabase(db_old), mirror=mirror_old
+            )
+            check("报告里说清了还有多少没读过", report.unread_before, 2)
+            check("两条都扫到了（20 天前那条也在内）", report.scanned, 2)
+            check("20 天前那条被处理了", mirror_old.get("900").state, STATE_DONE)
+            check("新的那条也被处理了", mirror_old.get("901").state, STATE_DONE)
+            check("于是建了 2 条通知", len(notifications(token)) - before, 2)
+
+            # 第二轮：都读过了 → 不再重复扫（增量靠的就是这个）
+            report = await run_cycle(
+                backend_old, settings_old, db=SourceDatabase(db_old), mirror=mirror_old
+            )
+            check("第二轮没有没读过的了", report.unread_before, 0)
+            check("只做了回看（新消息在回看窗口内）", report.rechecked, 1)
+            check("没有重抽任何一条", report.processed, 0)
+        finally:
+            await backend_old.close()
     finally:
         await backend.close()
 

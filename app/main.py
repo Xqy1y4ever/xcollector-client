@@ -51,7 +51,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="只做「解密 nt_msg.db + 导出」，强制重跑一遍然后退出",
     )
     parser.add_argument("--dry-run", action="store_true", help="只组装不写入")
-    parser.add_argument("--since-hours", type=int, default=None, help="忽略游标，从 N 小时前重扫")
+    parser.add_argument(
+        "--since-hours",
+        type=int,
+        default=None,
+        help="把「内容改动的回看窗口」放大到 N 小时（不影响「哪些没读过」）",
+    )
     parser.add_argument("--limit", type=int, default=None, help="本轮最多处理多少条")
     parser.add_argument("--log-level", default=None, help="覆盖 CLIENT_LOG_LEVEL")
     return parser.parse_args(argv)
@@ -73,7 +78,7 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
     print(f"                  发送者={sender_wl}")
     print(f"  抽取器          {settings.client_extractor}")
     print(f"  轮询间隔        {settings.client_poll_seconds}s")
-    print(f"  回看窗口        {settings.client_recheck_overlap_hours}h（识别内容改动的范围）")
+    print(f"  回看窗口        {settings.client_recheck_overlap_hours}h（已读消息重看、识别内容改动的范围）")
     print(
         f"  补充关系        {'开' if settings.client_amendment_enabled else '关'}"
         f"（只认 {settings.client_amendment_max_age_hours}h 之内的引用）"
@@ -151,6 +156,19 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
     print(f"  共 {stats['total']} 条，状态 {stats['by_state'] or {}}")
     print(f"  补充关系 {stats['amendments']} 条")
     print(f"  水位线（已处理完的最大时间戳）：{mirror.watermark() or '（还没有）'}")
+    # 读什么由**这个**决定，不由时间决定：源库里没被标记过的都要读，不管多老。
+    try:
+        unread = db.count_unread(settings.resolved_mirror_path)
+        print(
+            f"  没读过的消息    {unread} 条"
+            + (
+                "（下一轮接着读；一轮最多读 CLIENT_MAX_MESSAGES_PER_CYCLE 条）"
+                if unread
+                else "（都读过了，下一轮只读新增的）"
+            )
+        )
+    except SourceDatabaseError as exc:
+        print(f"  没读过的消息    算不出来：{exc}")
     unfinished = mirror.unfinished()
     if unfinished:
         print(f"  ⚠️ 有 {len(unfinished)} 条没处理完（下一轮会重试）")
@@ -242,14 +260,16 @@ async def run_once(backend: BackendClient, settings, *, since_hours: int | None 
         return 2
 
     if since_hours is not None:
-        # `--since-hours N` = 把扫描起点往前推到 N 小时前重看一遍。
+        # `--since-hours N` = 把「内容改动的回看窗口」放大到 N 小时。
         #
-        # 镜像里已经有状态的消息**不会被当成新的**（内容没变就跳过），所以它的
-        # 真正用途是：**内容被改过**的消息（超出回看窗口的那些）也要重新处理一遍。
-        # 实现方式是临时把回看窗口放大到 N 小时，而不是去动镜像 ——
+        # ⚠️ 它**不**决定"哪些没读过"：没读过的消息无论如何都会被读到（判据是镜像里的
+        # 已读标记）。它的真正用途是把**已经读过、但内容可能被改过**的消息的重看范围
+        # 放大 —— 比如改了抽取规则想重跑、或者怀疑某批老消息被编辑过。
+        # 实现方式是临时放大回看窗口，而不是去动镜像 ——
         # 镜像记的是事实（每一条处理过没有），不该被一次调用改写。
         logger.info(
-            "按 --since-hours=%s 把回看窗口临时放大到 %s 小时（重新检查这个范围内的内容改动）",
+            "按 --since-hours=%s 把「内容改动的回看窗口」临时放大到 %s 小时"
+            "（已读消息里，这个范围内的会重新比对内容指纹）",
             since_hours,
             since_hours,
         )

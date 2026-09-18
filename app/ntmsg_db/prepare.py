@@ -194,6 +194,10 @@ def prepare_databases(settings, *, force: bool = False) -> PrepareReport:
         )
 
     if force or _is_stale(plain, export):
+        # 增量导出默认**关**：按时间过滤会让"时间戳没变、内容变了"的旧消息永远进不了
+        # 导出库，而客户端那边也就永远发现不了它被编辑过（见 config 里的说明）。
+        # `--prepare`（force）一定是全量。
+        incremental = bool(settings.client_export_incremental) and not force
         report.export = export_database(
             plain,
             export,
@@ -201,7 +205,7 @@ def prepare_databases(settings, *, force: bool = False) -> PrepareReport:
             include_c2c=bool(settings.client_export_include_c2c),
             overlap_seconds=int(settings.client_export_overlap_seconds),
             add_seq=bool(settings.client_export_add_seq),
-            resume=not force,
+            resume=incremental,
         )
         report.exported = True
     else:

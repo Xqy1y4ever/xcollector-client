@@ -50,7 +50,7 @@ from msgdb.export_schema import (
 )
 from msgdb.group import exporter as group_exporter
 
-from .sqlite_uri import quote_sql, sqlite_uri
+from ..utils import quote_sql, sqlite_uri
 
 logger = logging.getLogger(__name__)
 
@@ -202,8 +202,10 @@ def export_database(
     """`nt_msg_plain.db` → `nt_msg_export.db`。
 
     `resume=True` 时按导出库里已有的最大时间戳接着导（并往回多看
-    `overlap_seconds` 秒，覆盖"同一秒里后到的消息"）。导出是幂等的
-    （`INSERT OR REPLACE`，主键 `msg_id`），所以从头再来一遍也是安全的，只是慢。
+    `overlap_seconds` 秒）。**默认（`resume=False`）是全量**，因为按时间过滤有个
+    后果：时间戳没变、内容被改过的旧消息不会重新进导出库 —— 客户端那一层靠内容
+    指纹发现"内容变了"的前提就是导出库里有新内容。全量的代价是每轮重新解析一遍
+    源库（实测 77 万行约 45 秒）。
     """
     started = time.monotonic()
     src_path = Path(src)

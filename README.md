@@ -75,9 +75,9 @@ BACKEND_BASE_URL=http://127.0.0.1:8000
 | `LLM_API_BASE` / `LLM_MODEL` / `LLM_API_KEY` | DeepSeek | `CLIENT_EXTRACTOR` 用 `llm`/`both` 时才需要 |
 | `CLIENT_GROUP_WHITELIST` / `CLIENT_SENDER_WHITELIST` | 空 | **只做收窄，不做开关**：留空 = 不额外限制（真正的过滤条件是你在后端配的订阅）。格式与 bot 相同 |
 | `CLIENT_POLL_SECONDS` | `300` | `--loop` 的轮询间隔 |
-| `CLIENT_INITIAL_LOOKBACK_HOURS` | `72` | 首次运行往回看多少小时 |
-| `CLIENT_MAX_MESSAGES_PER_CYCLE` / `CLIENT_BATCH_SIZE` | `500` / `200` | 一轮最多处理 / 一次最多取多少条 |
-| `CLIENT_MIRROR_PATH` | 源库旁边 | 客户端自己的状态库（每条消息处理过没有）。**别删**，删了会重新抽一遍 |
+| `CLIENT_MAX_MESSAGES_PER_CYCLE` / `CLIENT_BATCH_SIZE` | `500` / `200` | **一轮读多少**；不决定读哪些（没读过的都会读到，见下） |
+| `CLIENT_MIRROR_PATH` | 源库旁边 | 客户端自己的状态库（已读标记 + 内容指纹）。**别删**，删了会把整个源库重读一遍 |
+| `CLIENT_RECHECK_OVERLAP_HOURS` | `2` | 已读消息的重看窗口（用来发现"内容被编辑过"） |
 | `CLIENT_ATTACHMENT_ROOT` | 空 | NTQQ 附件目录，按 md5/文件名找回真实字节并上传 |
 | `CLIENT_DECRYPT_TABLES` | 空 = 全部 | 只解密需要的表（如 `group_msg_table,c2c_msg_table`）会快一些 |
 | `CLIENT_DECRYPT_MAX_SKIPS` | `-1` | 允许多少行因坏页被跳过。每次跳过都会打 ERROR 日志 |
@@ -96,11 +96,11 @@ BACKEND_BASE_URL=http://127.0.0.1:8000
 
 ```bash
 python -m app.main --prepare         # 只做「剥头 + 解密 + 导出」，不连后端（第一次建议先跑）
-python -m app.main --status          # 自检：配置、源库、镜像、身份、订阅。**不写任何东西**
+python -m app.main --status          # 自检：配置、源库、镜像、还有多少没读过、身份、订阅。**不写任何东西**
 python -m app.main --once            # 跑一轮就退出（推荐配合计划任务）
 python -m app.main --loop            # 常驻，按 CLIENT_POLL_SECONDS 定期跑
 python -m app.main --dry-run --once  # 只组装不写入，先看一眼会抽出什么
-python -m app.main --since-hours 72  # 强制重抽 72 小时内的消息
+python -m app.main --since-hours 72  # 把「内容改动的回看窗口」放大到 72 小时（已读的也重看）
 ```
 
 `--prepare` 会把每张表拷了多少行、跳过多少行、SQLite 自检结果打印出来。
@@ -146,13 +146,30 @@ python -m app.main --status
 ```
 
 它会打印：后端可达性与身份（是不是 UserToken）、源库路径与行数、镜像库状态、
+**还有多少条没读过**（判据是镜像里的已读标记，不是时间）、
 **你在后端配的订阅**（订阅是真正的过滤条件，一条都没有 = 什么都不会入库）、
 以及源表有没有序号列（决定"回复改期"能不能落到原任务上）。
 
+## 它按什么决定"读哪些消息"
+
+**按已读标记，不按时间。** 源库里凡是镜像里没标记过的都要读，不管它多老；
+标记过的就不重复读。这样"比任何时间窗口都老、而镜像里又没有"的消息
+（换过导出库、镜像被删过、白名单刚放开、上一版导出漏了一批）**一定会被读到**。
+
+时间窗口只剩一个用途：**回看窗口**（`CLIENT_RECHECK_OVERLAP_HOURS`，默认 2 小时）——
+把最近这段**已读**的消息重看一遍、比对内容指纹，用来发现"消息被编辑过"。
+
+代价说清楚：**第一轮会把源库里所有群消息过一遍**（几十万条）。这是刻意的 ——
+订阅外的消息会被记成 `skipped`（很便宜，不调模型），一轮之后就不再重复读。
+想少读一点，用 `CLIENT_GROUP_WHITELIST` / `CLIENT_SENDER_WHITELIST` 收窄。
+一轮读多少由 `CLIENT_MAX_MESSAGES_PER_CYCLE` 控制，所以积压是分多轮读完的，
+`--status` 里的"没读过的消息"会告诉你还剩多少。
+
 ## 已知边界
 
-- **增量导出按时间戳**：老消息被编辑（时间戳不变）时增量不会重看它，
-  需要时跑一次 `--prepare` 强制全量。
+- **导出也是全量的**（`CLIENT_EXPORT_INCREMENTAL=false`）：按时间过滤的增量导出会让
+  "时间戳没变、内容变了"的旧消息永远不进导出库，客户端也就永远发现不了它被编辑过。
+  全量的代价是每轮重新解析一遍源库（实测 77 万行约 45 秒）。
 - **坏行会被跳过**，但会记下 rowid、打 ERROR、报告里标 `ok=False`；
   整张表**整块**读不下去时会直接停下来要求人工处理。
 - **附件字节多半拿不到**：导出库里只有文件名、md5 和一段会过期的 CDN 相对路径，

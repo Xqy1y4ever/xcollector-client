@@ -20,6 +20,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from app.mirror import Mirror
 from app.source.attachments import AttachmentResolver, guess_content_type
 from app.source.ntmsg import (
     SourceDatabase,
@@ -172,6 +173,111 @@ def main() -> int:  # noqa: C901
         check("limit=3 只取 3 条", got, ["1001", "1002", "1003"])
         got_all = [m.msg_id for m in db.iter_since(0, "", limit=100, chunk=2)]
         check("limit 大于总数时取全部", got_all, ["1001", "1002", "1003", "1004", "1005"])
+
+        # ------------------------------------------------------------------
+        print("\n--- 4b. 按「读没读过」扫描（主路径）---")
+        # 判据是镜像里的已读标记，不是时间：镜像里没有的都要读，不管它多老。
+        mirror_db = tmp_path / "mirror.db"
+        if mirror_db.exists():
+            mirror_db.unlink()
+        mirror = Mirror(mirror_db)
+
+        check("镜像不存在时全部算没读过", db.count_unread(mirror_db), 5)
+        unread = [m.msg_id for m in db.iter_unread(mirror_db, limit=10)]
+        check("顺序是从最老的开始（补充关系的原文必须先于补充）", unread, ["1001", "1002", "1003", "1004", "1005"])
+        check("一处也没有重复", len(unread), len(set(unread)))
+
+        # 标记两条已读（内容指纹随便给，这里只测"读没读过"）
+        for msg_id in ("1001", "1002"):
+            mirror.claim(db.fetch_by_ids([msg_id])[msg_id])
+            mirror.finish(msg_id, state="done")
+        check("读过的就不再出现", db.count_unread(mirror_db), 3)
+        check(
+            "剩下的三条按时间正序",
+            [m.msg_id for m in db.iter_unread(mirror_db, limit=10)],
+            ["1003", "1004", "1005"],
+        )
+        check("limit 生效（分多轮读）", [m.msg_id for m in db.iter_unread(mirror_db, limit=2)], ["1003", "1004"])
+
+        # 分页不能因为"处理时会把镜像写进去"而重复：这里刻意**不写镜像**，
+        # 模拟 --dry-run（dry-run 是不记账的，靠副作用翻页就会反复读同一批）。
+        paged = [m.msg_id for m in db.iter_unread(mirror_db, limit=3, chunk=1)]
+        check("一块一条地翻页也不重复", paged, ["1003", "1004", "1005"])
+
+        # 回看模式：已读的也要能重看（发现"内容被编辑"就靠它），且是最新优先
+        rechecked = [
+            m.msg_id
+            for m in db.iter_unread(mirror_db, limit=10, recheck_since=1757692800)
+        ]
+        check("回看模式会把已读的也带回来", rechecked, ["1005", "1004", "1003", "1002", "1001"])
+        check(
+            "回看模式是最新优先（预算不够时先看最新的）",
+            [m.msg_id for m in db.iter_unread(mirror_db, limit=2, recheck_since=1757692800)],
+            ["1005", "1004"],
+        )
+        check(
+            "回看窗口只决定「读过的」要不要重看，不缩小没读过的范围",
+            [m.msg_id for m in db.iter_unread(mirror_db, limit=10, recheck_since=1757692900)],
+            ["1005", "1004", "1003"],
+        )
+
+        # 排除这一轮已经处理过的（回看窗口与「没读过」是并集，不排就会处理两遍）。
+        check(
+            "回看可以排除这一轮已经看过的",
+            [
+                m.msg_id
+                for m in db.iter_unread(
+                    mirror_db, limit=10, recheck_since=1757692800, exclude={"1005"}
+                )
+            ],
+            ["1004", "1003", "1002", "1001"],
+        )
+        check(
+            "排除名单跟着分页走（chunk=1 也不能漏）",
+            [
+                m.msg_id
+                for m in db.iter_unread(
+                    mirror_db,
+                    limit=10,
+                    chunk=1,
+                    recheck_since=1757692800,
+                    exclude={"1005", "1004"},
+                )
+            ],
+            ["1003", "1002", "1001"],
+        )
+        check(
+            "未读模式也能排除（排除掉的那条不该占位置）",
+            [m.msg_id for m in db.iter_unread(mirror_db, limit=10, exclude={"1003"})],
+            ["1004", "1005"],
+        )
+
+        # msg_id 类型：镜像里是 TEXT，导出表里可能是 INTEGER —— 不转类型的话
+        # 反连接会"全部命中"，等于每次把整个库读一遍。
+        int_ids = tmp_path / "int_ids.db"
+        if int_ids.exists():
+            int_ids.unlink()
+        conn = sqlite3.connect(int_ids)
+        try:
+            conn.executescript(
+                SCHEMA.replace("TEXT PRIMARY KEY", "INTEGER PRIMARY KEY")
+            )
+            conn.executemany(
+                "INSERT INTO group_messages (msg_id, timestamp, direction, sender_uid, sender_qq,"
+                " group_id, group_qq, msg_type, content_type, text, parse_status, content)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                [(7001, 1757693000, 0, "u_a", "10001", "123456789", 123456789, 2, 1, "整数 id", "typed", None)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        int_db = SourceDatabase(int_ids)
+        int_db.inspect()
+        check("整数 msg_id 的库：镜像空 → 1 条没读过", int_db.count_unread(mirror_db), 1)
+        mirror_int = Mirror(tmp_path / "mirror-int.db")
+        mirror_int.claim(int_db.fetch_by_ids(["7001"])["7001"])
+        mirror_int.finish("7001", state="done")
+        check("整数 msg_id 也能被反连接排除（类型转换对了）", int_db.count_unread(tmp_path / "mirror-int.db"), 0)
 
         # ------------------------------------------------------------------
         print("\n--- 5. 正文与附件解析 ---")

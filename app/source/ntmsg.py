@@ -47,10 +47,11 @@
 2. **列名不写死单一版本**。先用 `PRAGMA table_info` 读实际列名，缺列时按"这一列
    没有"处理并记一行 warning —— 上游换版本加/改列时，客户端应该退化而不是崩。
    唯一真正必需的是 `msg_id` 和 `timestamp`。
-3. **增量按 (timestamp, msg_id) 走**。不用 rowid（导出库重建后 rowid 会变），
-   也不用 `msg_id >`（`msg_id` 是字符串，跨版本不一定单调）。
-   `timestamp` 可能有大量并列，所以用元组比较，并**包含边界**（`>=`）——
-   宁可重复读一条（后端幂等会挡住），也不能跳过同一秒里的其他消息。
+3. **"读没读过"由镜像决定，不由时间决定**。主扫描是"镜像里没有的都要读"
+   （`iter_unread` / `count_unread`，靠 `ATTACH` 镜像库做反连接）。时间窗口只用
+   在一个地方：回看最近一段**已读**的消息，看内容有没有被编辑过（`recheck_since`）。
+   为什么不拿时间当选取依据：窗口表达不了"这条处理过没有"，比窗口更老又没读过的
+   消息会被永远跳过 —— 而"该看到的没看到"正是这套系统最怕的失败。
 """
 
 from __future__ import annotations
@@ -61,7 +62,9 @@ import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Collection, Iterable, Iterator, Sequence
+
+from ..utils import quote_sql, sqlite_uri
 
 logger = logging.getLogger(__name__)
 
@@ -502,6 +505,187 @@ class SourceDatabase:
         if row is None:
             return None
         return int(row["t"]), str(row["m"])
+
+    # ---------------- 按"读没读过"扫描（主路径） ----------------
+    #
+    # 判据是**镜像里有没有这条**（等价于"标没标已读"），**不是时间窗口**。
+    #
+    # 为什么不用时间窗口：窗口表达不了"这条到底处理过没有"。比窗口更老、而镜像里又
+    # 没有的消息（换了导出库、镜像被删过、白名单刚放开、导出曾经漏了一批）永远不会
+    # 被读到 —— 而"该看到的没看到"正是这套系统最怕的失败。时间窗口只能用来省扫描量，
+    # 省下来的代价是静默漏消息，所以不作为选取依据。
+    #
+    # 代价说清楚：没有任何过滤时，第一次运行会把导出库里**所有**群消息过一遍
+    # （几十万条）。这是刻意的：它们会被逐条标记（订阅外的记 skipped，很便宜），
+    # 一轮之后就不再重复读。真正花钱的抽取仍然只发生在订阅命中的消息上。
+    # 想少读一点，用 `CLIENT_GROUP_WHITELIST` / `CLIENT_SENDER_WHITELIST` 收窄。
+
+    def _attach_mirror(self, conn: sqlite3.Connection, mirror_path: Path | str) -> None:
+        """把镜像库（只读）挂进源库连接，用来做"没读过"的反连接。
+
+        ⚠️ 两处必须这么写：URI 要当**字面量**传（`ATTACH DATABASE ?` 用绑定参数时
+        不解析 URI，会把 `?mode=ro` 当成文件名的一部分）；而源连接本来就是
+        `uri=True` 打开的，所以字面量 URI 才生效。
+        """
+        mirror = Path(mirror_path)
+        if not mirror.exists():
+            # 镜像还没有 = 一条都没读过 → 反连接全命中。这里仍然挂一个空库，
+            # 让后面的 SQL 只有一条路径（少一种分支就少一处错的可能）。
+            conn.execute("ATTACH DATABASE ':memory:' AS xc_mirror")
+            conn.execute(
+                "CREATE TABLE xc_mirror.message (msg_id TEXT PRIMARY KEY)"
+            )
+            return
+        conn.execute(
+            "ATTACH DATABASE " + quote_sql(sqlite_uri(mirror, "ro")) + " AS xc_mirror"
+        )
+
+    def _unread_where(self, *, recheck_since: int | None) -> str:
+        # `CAST(... AS TEXT)`：镜像里的 msg_id 是 TEXT，而导出表的 msg_id 在
+        # nt_msg_db_util 的表结构里是 INTEGER 主键 —— SQLite 比较 INTEGER 与 TEXT
+        # **永远不相等**，不转类型的话反连接会"全部命中"，等于每次都把整个库读一遍。
+        where = (
+            "NOT EXISTS (SELECT 1 FROM xc_mirror.message m"
+            " WHERE m.msg_id = CAST(t.msg_id AS TEXT))"
+        )
+        if recheck_since is not None:
+            # 回看：镜像里已读、但最近又被碰过的消息也要重看（这是"内容被编辑"
+            # 唯一的发现途径）。
+            where = f"(({where}) OR (t.timestamp >= ?))"
+        return where
+
+    def fetch_unread(
+        self,
+        mirror_path: Path | str,
+        *,
+        limit: int,
+        recheck_since: int | None = None,
+        cursor: tuple[int, str] | None = None,
+        exclude: Collection[str] | None = None,
+    ) -> list[SourceMessage]:
+        """取**镜像里没有**的消息（`recheck_since` 给了就带上回看窗口）。
+
+        翻页用 `cursor`（上一条的 `(timestamp, msg_id)`）而不是靠"处理时会把镜像写
+        进去"：`--dry-run` 不写镜像，靠副作用翻页会让同一批被反复读出来。
+
+        两种模式的顺序不同：
+          * 未读模式（`recheck_since=None`）：**按时间正序**（从最老的未读开始，
+            这样补充关系里的"原文"一定先于"补充"被处理）；
+          * 回看模式：**按时间倒序**（窗口比预算大时，先看最新的那一段 ——
+            否则最早那几条会把预算吃光，新的内容改动永远排不上）。
+
+        `exclude` 是**这一轮已经处理过**的 msg_id（回看时用）：回看窗口与"没读过"
+        是**并集**，刚在未读那一步处理过的消息自然也落在窗口里；不排掉的话同一条
+        内容会在一轮里被处理两遍（dry-run 下就是白花一次抽取），`scanned` 也会虚高。
+        做成 SQL 条件而不是在 Python 里 `continue`：否则"取 limit 条再丢掉"会让真正
+        该回看的老消息被挤掉，而这是静默的。
+        """
+        mirror = Path(mirror_path)
+        descending = recheck_since is not None
+        where = self._unread_where(recheck_since=recheck_since)
+        params: list = []
+        if recheck_since is not None:
+            params.append(int(recheck_since))
+        if cursor is not None:
+            ts, msg_id = int(cursor[0]), str(cursor[1])
+            if descending:
+                where += " AND (t.timestamp < ? OR (t.timestamp = ? AND t.msg_id < ?))"
+            else:
+                where += " AND (t.timestamp > ? OR (t.timestamp = ? AND t.msg_id > ?))"
+            params.extend([ts, ts, msg_id])
+        excluded = [str(i) for i in (exclude or ())]
+        if excluded:
+            # 分批写：SQLite 对一条语句里的绑定参数个数有上限（老版本 999），
+            # 拆成多组 `NOT IN (...)` 而不是把上限赌在版本上。
+            clauses = []
+            for start in range(0, len(excluded), 500):
+                group = excluded[start : start + 500]
+                clauses.append(
+                    "CAST(t.msg_id AS TEXT) NOT IN (" + ",".join("?" * len(group)) + ")"
+                )
+                params.extend(group)
+            where += " AND " + " AND ".join(clauses)
+        params.append(int(limit))
+        order = (
+            "ORDER BY t.timestamp DESC, t.msg_id DESC"
+            if descending
+            else "ORDER BY t.timestamp ASC, t.msg_id ASC"
+        )
+
+        with closing(self._connect()) as conn:
+            if not self._columns:
+                self._columns = _column_names(conn, self._table)
+            select = [
+                c
+                for c in ("msg_id", "timestamp", *OPTIONAL_COLUMNS, *_EXTRA_COLUMNS)
+                if c in self._columns
+            ]
+            columns_sql = ", ".join('"' + c + '"' for c in select)  # 数字列名必须加引号
+            self._attach_mirror(conn, mirror)
+            sql = (
+                f'SELECT {columns_sql} FROM "{self._table}" AS t'
+                f" WHERE {where} {order} LIMIT ?"
+            )
+            try:
+                rows = conn.execute(sql, tuple(params)).fetchall()
+            except sqlite3.Error as exc:
+                raise SourceDatabaseError(
+                    f"查询源库失败（{self.path.name}）：{exc}。"
+                    "如果提示 database is locked，说明导出工具正在写它 —— "
+                    "确认导出是「跑完再读」还是「边写边读」，前者要等它写完。"
+                ) from exc
+        return [self._to_message(row) for row in rows]
+
+    def count_unread(self, mirror_path: Path | str) -> int:
+        """还有多少条没读过（给日志与 `--status` 用；**不是**用来限制读取的）。"""
+        mirror = Path(mirror_path)
+        with closing(self._connect()) as conn:
+            if not self._columns:
+                self._columns = _column_names(conn, self._table)
+            self._attach_mirror(conn, mirror)
+            try:
+                row = conn.execute(
+                    f'SELECT COUNT(*) AS n FROM "{self._table}" AS t'
+                    f" WHERE {self._unread_where(recheck_since=None)}"
+                ).fetchone()
+            except sqlite3.Error as exc:
+                raise SourceDatabaseError(f"统计未读失败（{self.path.name}）：{exc}") from exc
+        return int(row["n"] if row else 0)
+
+    def iter_unread(
+        self,
+        mirror_path: Path | str,
+        *,
+        limit: int,
+        chunk: int = 500,
+        recheck_since: int | None = None,
+        exclude: Collection[str] | None = None,
+    ) -> Iterator[SourceMessage]:
+        """分块迭代"没读过的"消息，直到取满 `limit` 或没有更多。
+
+        分块是因为不能把几十万条一次塞进内存；`limit` 是一轮的总预算。
+        游标跟着上一条走，所以不依赖"处理时会把镜像写进去"（dry-run 也能正确翻页）。
+        `exclude` 透传给 `fetch_unread`（每一页都带上同一份排除名单）。
+        """
+        taken = 0
+        cursor: tuple[int, str] | None = None
+        while taken < limit:
+            want = min(chunk, limit - taken)
+            batch = self.fetch_unread(
+                mirror_path,
+                limit=want,
+                recheck_since=recheck_since,
+                cursor=cursor,
+                exclude=exclude,
+            )
+            if not batch:
+                return
+            for message in batch:
+                yield message
+                taken += 1
+            cursor = (batch[-1].timestamp, batch[-1].msg_id)
+            if len(batch) < want:
+                return
 
     def fetch_since(
         self,

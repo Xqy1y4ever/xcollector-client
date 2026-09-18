@@ -101,3 +101,29 @@ def json_text(value: Any, default: Any) -> str:
         return json.dumps(value if value is not None else default, ensure_ascii=False)
     except (TypeError, ValueError):
         return json.dumps(default, ensure_ascii=False)
+
+
+def sqlite_uri(path: Any, mode: str | None = None) -> str:
+    """把文件路径拼成 SQLite 的 URI（`file:...?mode=ro`）。
+
+    为什么不能直接拼字符串：`?` 和 `#` 在 URI 里有特殊含义，路径里真出现这两个字符
+    时会被解析成"带查询参数的路径"，于是打开的是另一个文件 —— 那种错很难查。
+
+    还有一个坑：**`ATTACH DATABASE ?` 用绑定参数时不解析 URI**（只有连接本身是
+    `uri=True` 打开的、并且把 URI 当 SQL 字面量传入时才认）。所以调用点用的是
+    `quote_sql(sqlite_uri(...))`，而不是参数。
+    """
+    from pathlib import Path
+
+    text = Path(str(path)).as_posix()
+    for raw, encoded in (("%", "%25"), ("?", "%3F"), ("#", "%23")):
+        text = text.replace(raw, encoded)
+    uri = f"file:{text}"
+    if mode:
+        uri += f"?mode={mode}"
+    return uri
+
+
+def quote_sql(text: str) -> str:
+    """把字符串塞进 SQL 字面量（单引号翻倍）。"""
+    return "'" + str(text).replace("'", "''") + "'"
