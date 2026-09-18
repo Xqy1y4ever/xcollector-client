@@ -33,7 +33,7 @@ from app.config import (
     BATCH_SIZE,
     BASE_DIR,
     CROSS_CHECK_ENABLED,
-    EXPORT_OVERLAP_SECONDS,
+    EXPORT_BATCH,
     MAX_MESSAGES_PER_CYCLE,
     NT_MSG_HEADER_SIZE,
     NT_MSG_KDF_ITER,
@@ -247,7 +247,8 @@ def main() -> int:  # noqa: C901
                f"{NT_MSG_PAGE_SIZE}/{NT_MSG_KDF_ITER}")
     check_true("抽头长度是 1024（上游 1.decrypt.py 的常量）", NT_MSG_HEADER_SIZE == 1024,
                str(NT_MSG_HEADER_SIZE))
-    check_true("导出是全量（没有增量开关）", EXPORT_OVERLAP_SECONDS > 0, str(EXPORT_OVERLAP_SECONDS))
+    check_true("导出是按 msg_id 增量的（没有时间窗口这种模糊判据）",
+               isinstance(EXPORT_BATCH, int) and EXPORT_BATCH > 0, str(EXPORT_BATCH))
     check_true("默认不把图片喂给模型、也不做交叉验证（要开就去改常量）",
                VLM_ENABLED is False and CROSS_CHECK_ENABLED is False, "VLM/CROSS_CHECK")
 

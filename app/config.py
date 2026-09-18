@@ -380,9 +380,6 @@ DECRYPT_MAX_SKIPS = -1
 EXPORT_BATCH = 2000
 # 要不要连私聊一起导（和上游 3.export.py 一样两张表都导）。
 EXPORT_INCLUDE_C2C = True
-# 导出**永远全量**（不做增量）。按时间过滤会让"时间戳没变、内容变了"的旧消息
-# 永远不进导出库，那一层一层往上看就都看不见它。全量代价：实测 77 万行约 45 秒。
-EXPORT_OVERLAP_SECONDS = 3600
 
 
 @lru_cache(maxsize=1)

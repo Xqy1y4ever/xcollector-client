@@ -558,15 +558,15 @@ def test_export() -> None:
         bad = conn.execute('SELECT * FROM group_messages WHERE msg_id=1003').fetchone()
         check(bad["parse_status"] == "invalid" and bad["text"] is None, "读不通的行照样入库")
 
-    section("导出：幂等与全量")
-    check(watermark(fixture.export) == 1_700_000_000 + fixture.rows - 1, "水位线是最新时间戳")
+    section("导出：增量（按 msg_id 接着导）")
+    check(watermark(fixture.export) == 1000 + fixture.rows - 1, "水位线是最大 msg_id")
     full_again = export_database(fixture.plain, fixture.export)
-    check(full_again.written_rows.get("group_messages") == fixture.rows, "再导一遍仍是同样行数")
+    check(full_again.written_rows.get("group_messages") == 0, "没有新行 → 一行都不写")
     with closing(sqlite3.connect(sqlite_uri(fixture.export, "ro"), uri=True)) as conn:
         count = conn.execute("SELECT count(*) FROM group_messages").fetchone()[0]
-    check(count == fixture.rows, f"重导后总行数不变（幂等）：{count}")
+    check(count == fixture.rows, f"总行数不变（幂等）：{count}")
 
-    # 源库多了一行 → 全量重导必须把它带进来（**默认就是全量**，不做增量过滤）
+    # 源库多了一行 → 只导这一行（不是全量重导）
     with closing(sqlite3.connect(str(fixture.plain))) as conn:
         conn.execute(
             "INSERT INTO group_msg_table VALUES (2000, 99, 2, 0, 0, 'u_z', '894880656', 7, 20009,"
@@ -574,12 +574,36 @@ def test_export() -> None:
         )
         conn.commit()
     inc = export_database(fixture.plain, fixture.export)
-    check(inc.written_rows.get("group_messages") == fixture.rows + 1,
-          f"全量重导把新行带进来：{inc.written_rows}")
+    check(inc.written_rows.get("group_messages") == 1, "只导新的那 1 行（不是全量）")
+    check(inc.since_msg_id.get("group_messages") == 1000 + fixture.rows - 1,
+          "起点是上次的最大 msg_id")
     with closing(sqlite3.connect(sqlite_uri(fixture.export, "ro"), uri=True)) as conn:
         count = conn.execute("SELECT count(*) FROM group_messages").fetchone()[0]
         newest = conn.execute("SELECT max(msg_id) FROM group_messages").fetchone()[0]
     check(count == fixture.rows + 1 and newest == 2000, f"新行进来了（共 {count} 行）")
+
+    section("导出：幂等与强制全量")
+    forced = export_database(fixture.plain, fixture.export, full=True)
+    check(forced.written_rows.get("group_messages") == fixture.rows + 1, "full=True 真的是全量")
+    with closing(sqlite3.connect(sqlite_uri(fixture.export, "ro"), uri=True)) as conn:
+        count = conn.execute("SELECT count(*) FROM group_messages").fetchone()[0]
+    check(count == fixture.rows + 1, f"全量重导后行数不变（幂等）：{count}")
+
+    section("导出：源库倒退 → 整表重导")
+    with closing(sqlite3.connect(str(fixture.export))) as conn:
+        conn.execute(
+            "INSERT INTO group_messages (msg_id, timestamp, direction, sender_uid, sender_qq,"
+            " group_id, group_qq, msg_type, subtype, content_type, text, parse_status, content)"
+            " VALUES (99999, 1700009999, 0, 'x', 'x', 'g', 1, 7, 0, 1, '幽灵', 'typed', NULL)"
+        )
+        conn.commit()
+    rebuilt = export_database(fixture.plain, fixture.export)
+    check(rebuilt.rebuilt == ["group_messages"], "检测到就整表重导")
+    check(rebuilt.written_rows.get("group_messages") == fixture.rows + 1,
+          "重导后写满了源库的行数")
+    with closing(sqlite3.connect(sqlite_uri(fixture.export, "ro"), uri=True)) as conn:
+        ghost = conn.execute("SELECT count(*) FROM group_messages WHERE msg_id=99999").fetchone()[0]
+    check(ghost == 0, "幽灵行被清掉了")
 
     section("导出：关掉 c2c / 源库不对")
     only_group = export_database(
@@ -666,7 +690,7 @@ def test_reader() -> None:
 
 
 def test_prepare() -> None:
-    section("prepare：按文件时间决定要不要重跑")
+    section("prepare：按「有没有新行」决定要不要重跑")
     from app.config import Settings
     from tests._hermetic import isolate_settings
 
@@ -695,16 +719,60 @@ def test_prepare() -> None:
     check(report.enabled and report.decrypted and report.exported, "第一次：解密 + 导出都跑了")
     check(export.exists() and plain.exists(), "产物都在")
     check("解密" in report.summary() and "导出" in report.summary(), f"摘要：{report.summary()}")
+    check(report.export.total_written == fixture.rows * 2, "第一次导出是全量的（群 + 私聊）")
 
+    # ---- 没有新行：解密整段跳过，导出只是"确认一下没有新行" ----
     again = prepare_databases(settings)
-    check(not again.decrypted and not again.exported, "没变化时两步都跳过（只 stat 文件）")
+    check(not again.decrypted, "没有新行 → 不解密（连 SQLCipher 都不拷）")
+    check(again.exported, "导出照跑（它是增量的，不花什么时间）")
+    check(again.export.total_written == 0, "导出写入了 0 行")
+    check("跳过" in again.summary(), f"摘要：{again.summary()}")
 
+    # 文件时间变了但**内容没变**（QQ 每隔几秒就会写别的表）→ 仍然不该解密
     stat = fixture.encrypted.stat()
     import os
 
     os.utime(fixture.encrypted, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10_000_000_000))
-    third = prepare_databases(settings)
-    check(third.decrypted and third.exported, "nt_msg.db 变新 → 重新解密并重新导出")
+    touched = prepare_databases(settings)
+    check(not touched.decrypted, "只是 mtime 变了 → 还是不解密（判据是数据，不是时间）")
+
+    # ---- 真的来了新消息：解密续跑 + 导出只写新的那几条 ----
+    section("prepare：来了新消息（增量）")
+    new_row = (2000, 99, 2, 0, 0, "u_new", "894880656", 7, 20007, 1_700_000_500,
+               body(text_segment("下周一交实验报告 uniqtoken", 2000)), 0, 0, 894880656)
+    _append_encrypted_row(fixture, "group_msg_table", new_row)
+    report = prepare_databases(settings)
+    check(report.decrypted, "有新行 → 解密跑了")
+    check(report.export.written_rows.get("group_messages") == 1, "导出只写了新的那 1 行")
+    check(report.export.rebuilt == [], "没有整表重导")
+    with closing(sqlite3.connect(str(export))) as conn:
+        got = conn.execute("SELECT text FROM group_messages WHERE msg_id=2000").fetchone()
+        # FTS 是外部内容表：写了新行就必须重建，否则**用户拿导出库去搜会搜不到**
+        # （客户端自己不查 FTS，所以这件事只能靠这条断言守着）。
+        # 用一个 Latin 词当探针：unicode61 分词器会把一整串中文当成一个 token，
+        # 拿中文子串去 MATCH 是搜不到的。
+        fts = conn.execute(
+            "SELECT count(*) FROM group_messages_fts WHERE group_messages_fts MATCH 'uniqtoken'"
+        ).fetchone()[0]
+    check(bool(got) and got[0] == "下周一交实验报告 uniqtoken", "新行进了导出库")
+    check(fts == 1, "FTS 也更新了（写了新行就必须重建）")
+
+    # ---- 源库看起来"倒退"了（换了更旧的库/换了账号）→ 整表重导 ----
+    section("prepare：源库倒退时整表重导")
+    with closing(sqlite3.connect(str(export))) as conn:
+        conn.execute(
+            "INSERT INTO group_messages (msg_id, timestamp, direction, sender_uid, sender_qq,"
+            " group_id, group_qq, msg_type, subtype, content_type, text, parse_status, content)"
+            " VALUES (9999, 1700009999, 0, 'x', 'x', 'g', 1, 7, 0, 1, '幽灵行', 'typed', NULL)"
+        )
+        conn.commit()
+    report = prepare_databases(settings)
+    check(report.export.rebuilt == ["group_messages"], "检测到导出库比源库还新 → 整表重导")
+    with closing(sqlite3.connect(str(export))) as conn:
+        ghost = conn.execute("SELECT count(*) FROM group_messages WHERE msg_id=9999").fetchone()[0]
+        rows = conn.execute("SELECT count(*) FROM group_messages").fetchone()[0]
+    check(ghost == 0, "幽灵行被清掉了")
+    check(rows == fixture.rows, f"重导后行数 = 源库行数（{rows}）")
 
     section("prepare：配置不对时的表现")
     off = settings.model_copy(update={"client_nt_msg_db": ""})
@@ -720,6 +788,28 @@ def test_prepare() -> None:
     wrong = settings.model_copy(update={"client_nt_msg_key": "definitely-wrong"})
     expect_raises(DecryptError, lambda: prepare_databases(wrong),
                   "密钥错 → 明确报错", contains="密钥")
+
+
+def _append_encrypted_row(fixture: Fixture, table: str, row: tuple) -> None:
+    """往**加密的** nt_msg.db 里插一行，模拟"QQ 又收到了一条消息"。
+
+    做法：剥掉 1024 字节头 → 用 sqlcipher3 插行 → 把头拼回去。头只是一段被跳过的
+    字节，拼回去仍然是一个合法的 nt_msg.db（真机上 QQ 也是这么用的）。
+    """
+    raw = fixture.encrypted.read_bytes()
+    header, body_bytes = raw[:HEADER], raw[HEADER:]
+    tmp = fixture.root / "_append_clear.db"
+    tmp.write_bytes(body_bytes)
+    conn = sqlcipher3_connect(tmp)
+    try:
+        conn.execute(f'INSERT INTO "{table}" VALUES ({",".join("?" * len(row))})', row)
+        conn.execute("PRAGMA journal_mode = DELETE;")
+    finally:
+        conn.close()
+    fixture.encrypted.write_bytes(header + tmp.read_bytes())
+    tmp.unlink()
+    # 明文库那边也要让"没有新行"的判断失效（我们插的是更新的 rowid）
+    fixture.rows += 1
 
 
 def main() -> int:

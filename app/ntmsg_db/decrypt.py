@@ -200,20 +200,29 @@ class DecryptReport:
 def strip_header(src: Path | str, dst: Path | str, header_size: int = DEFAULT_HEADER_SIZE) -> bool:
     """`nt_msg.db` → `nt_msg_clear.db`：跳过前 `header_size` 字节，其余原样拷。
 
-    返回 True 表示真的拷了；False 表示目标文件已经是对的（大小一致），跳过。
+    返回 True 表示真的拷了；False 表示目标文件已经是对的，跳过。
+
+    ⚠️ "已经是对的"要看**修改时间**，不能只看大小：SQLite 会复用空闲页，所以
+    "又写了一条消息、文件大小没变"是常态。只看大小的后果很严重 —— 剥头被跳过，
+    明文库/导出库全都停在旧数据上，而**没有新行**这个判断也是基于这份旧文件的，
+    于是新消息永远进不来，界面上一切正常。这个洞是被 `check_ntmsg_db` 里
+    "往加密库插一行再看能不能检测到"那条用例逼出来的（插一行不改变文件大小）。
     """
     src_path = Path(src)
     dst_path = Path(dst)
     if not src_path.exists():
         raise DecryptError(f"找不到 nt_msg.db：{src_path}")
-    expected = src_path.stat().st_size - header_size
+    src_stat = src_path.stat()
+    expected = src_stat.st_size - header_size
     if expected <= 0:
         raise DecryptError(
-            f"{src_path} 只有 {src_path.stat().st_size:,} 字节，比 {header_size} 字节的文件头还小"
+            f"{src_path} 只有 {src_stat.st_size:,} 字节，比 {header_size} 字节的文件头还小"
         )
-    if dst_path.exists() and dst_path.stat().st_size == expected:
-        logger.info("[1/3] %s 已存在且大小一致，跳过剥头", dst_path.name)
-        return False
+    if dst_path.exists():
+        dst_stat = dst_path.stat()
+        if dst_stat.st_size == expected and dst_stat.st_mtime_ns >= src_stat.st_mtime_ns:
+            logger.info("[1/3] %s 已存在且不比源库旧，跳过剥头", dst_path.name)
+            return False
 
     logger.info("[1/3] 剥头：%s → %s", src_path.name, dst_path.name)
     dst_path.parent.mkdir(parents=True, exist_ok=True)

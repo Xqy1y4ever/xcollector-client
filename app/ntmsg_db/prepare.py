@@ -35,7 +35,6 @@ from ..config import (
     DECRYPT_MAX_SKIPS,
     EXPORT_BATCH,
     EXPORT_INCLUDE_C2C,
-    EXPORT_OVERLAP_SECONDS,
     NT_MSG_HEADER_SIZE,
     NT_MSG_HMAC_ALGORITHM,
     NT_MSG_KDF_ALGORITHM,
@@ -43,14 +42,15 @@ from ..config import (
     NT_MSG_PAGE_SIZE,
 )
 from .decrypt import DEFAULT_BATCH_SIZE, DEFAULT_HEADER_SIZE, DecryptError, DecryptReport
-from .decrypt import decrypt_database, sqlcipher_available
-from .export import ExportReport, export_database
+from .decrypt import decrypt_database, open_encrypted, sqlcipher_available, strip_header
+from .export import ExportReport, export_database, source_max_id
 
 logger = logging.getLogger(__name__)
 
-# 增量导出时往回多看的时间（秒）。导出是幂等的（主键 msg_id），重导一遍只是慢，
-# 所以宁可多看一点：同一秒里后到的消息也在窗口内。
-DEFAULT_EXPORT_OVERLAP_SECONDS = EXPORT_OVERLAP_SECONDS
+# 判断"有没有新行"时看这两张表（客户端真正会读的消息表）。
+# 其余表都是元数据（联系人、会话……），小、而且客户端不读它们的内容，
+# 不值得为它们牺牲"跳过整表拷贝"这个机会。
+SYNC_TABLES = ("group_msg_table", "c2c_msg_table")
 
 
 @dataclass
@@ -72,27 +72,75 @@ class PrepareReport:
         if self.decrypt is not None:
             parts.append(f"解密：{self.decrypt.summary()}")
         elif not self.decrypted:
-            parts.append("明文库还是新的，未重新解密")
+            parts.append("解密：跳过（没有新消息）")
         if self.export is not None:
             parts.append(f"导出：{self.export.summary()}")
-        elif not self.exported:
-            parts.append("导出库还是新的，未重新导出")
         parts.extend(self.notes)
         return "；".join(parts)
 
 
-def _mtime_ns(path: Path) -> int:
+def _max_rowid(conn, table: str) -> int | None:
+    """表的最大 rowid；表不存在返回 None。"""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    if not exists:
+        return None
+    row = conn.execute(f'SELECT max(rowid) FROM "{table}"').fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def _rows_pending(source: Path, clear: Path, plain: Path, settings) -> int:
+    """还有几张表有"没拷进明文库的新行"。>0 表示这一轮要解密。
+
+    为什么按 `max(rowid)` 判断而不是文件时间：文件时间只能说明"QQ 写过这个库"
+    （它每隔几秒就会写会话/联系人表），说明不了"有没有新消息"。按 rowid 判断才是
+    **数据本身**：数字一致就是没有新行，可以直接跳过整个 SQLCipher 拷贝。
+
+    ⚠️ 判断不出来时一律返回 1（要解密）—— 明文库不存在、没配密钥、装不上
+    sqlcipher3、打开失败……**宁可多解一次，也不能因为判断不出来就跳过**：
+    跳过的后果是新消息永远进不来，那是最坏的失败。
+    """
+    if not plain.exists():
+        return 1
     try:
-        return path.stat().st_mtime_ns
-    except OSError:
-        return -1
-
-
-def _is_stale(upstream: Path, downstream: Path) -> bool:
-    """上游文件比下游产物新（或下游不存在）→ 需要重跑。"""
-    if not downstream.exists():
-        return True
-    return _mtime_ns(upstream) > _mtime_ns(downstream)
+        strip_header(source, clear, NT_MSG_HEADER_SIZE)
+        key = read_key(settings)
+    except DecryptError:
+        return 1
+    if not key or not sqlcipher_available():
+        return 1
+    try:
+        enc = open_encrypted(
+            clear,
+            key,
+            page_size=NT_MSG_PAGE_SIZE,
+            kdf_iter=NT_MSG_KDF_ITER,
+            hmac_algorithm=NT_MSG_HMAC_ALGORITHM,
+            kdf_algorithm=NT_MSG_KDF_ALGORITHM,
+        )
+    except Exception as exc:  # noqa: BLE001 - 判断失败就交给解密那一步去报错
+        logger.debug("没法判断有没有新行（%s），还是解一次", exc)
+        return 1
+    try:
+        pending = 0
+        for table in SYNC_TABLES:
+            src_max = _max_rowid(enc, table)
+            if src_max is None:
+                continue
+            dst_max = source_max_id(plain, table)
+            if src_max > dst_max:
+                logger.info(
+                    "%s 多了 %s 行（%s → %s），要解密", table, f"{src_max - dst_max:,}",
+                    f"{dst_max:,}", f"{src_max:,}",
+                )
+                pending += 1
+        return pending
+    finally:
+        try:
+            enc.close()
+        except Exception:  # noqa: BLE001,S110
+            pass
 
 
 def resolve_paths(settings) -> tuple[Path, Path, Path, Path]:
@@ -124,8 +172,21 @@ def read_key(settings) -> str:
 def prepare_databases(settings) -> PrepareReport:
     """按需解密 + 导出。返回的 `export_path` 就是这一轮该读的库。
 
-    **全量导出**（没有增量模式）：按时间过滤会让"时间戳没变、内容变了"的旧消息
-    永远不进导出库，而客户端那边也就永远发现不了它被编辑过。
+    ## 每一轮只做"真的需要做"的那部分
+
+    两步各自判断，判断依据都是**数据**而不是文件时间：
+
+    * 解密：明文库里的 `max(rowid)` 和加密库里的一致 → **没有新行，跳过**
+      （连 SQLCipher 都不打开去做整表拷贝）；不一致 → 接着 rowid 续拷。
+    * 导出：按导出库里已有的 `max(msg_id)` 往后导（增量），一条新行都没有时
+      连 FTS 都不重建。
+
+    实测（真实 709MB / 77 万行）：没有任何新消息的一轮 ≈ 2 秒；来了几条新消息
+    ≈ 8 秒。以前是每轮固定 60 秒左右（全量解密 + 全量导出 + 每次重建 FTS）。
+
+    > 为什么以前是全量：那时客户端会"回看最近一段已读消息"，靠对比内容指纹发现
+    > 编辑过的通知 —— 增量导出会让编辑过的旧消息不进导出库。现在**已经不回看**了
+    > （见 README「它不做什么」），所以增量不再有任何代价。
     """
     report = PrepareReport()
     if not (settings.client_nt_msg_db or "").strip():
@@ -145,7 +206,8 @@ def prepare_databases(settings) -> PrepareReport:
             "（QQ 的原始库），不是导出库。"
         )
 
-    if _is_stale(source, plain):
+    pending = _rows_pending(source, clear, plain, settings)
+    if pending > 0:
         if not sqlcipher_available():
             raise DecryptError(
                 "要解密 nt_msg.db，但装不上 sqlcipher3。\n"
@@ -179,26 +241,25 @@ def prepare_databases(settings) -> PrepareReport:
         )
         report.decrypted = True
     else:
-        logger.debug("%s 比 %s 新，跳过解密", plain.name, source.name)
+        report.notes.append("解密：没有新消息，跳过")
+        logger.debug("%s 里没有新行，跳过解密", source.name)
 
-    if _is_stale(plain, export):
-        report.export = export_database(
-            plain,
-            export,
-            batch_size=EXPORT_BATCH,
-            include_c2c=EXPORT_INCLUDE_C2C,
-            overlap_seconds=EXPORT_OVERLAP_SECONDS,
-        )
-        report.exported = True
-    else:
-        logger.debug("%s 比 %s 新，跳过导出", export.name, plain.name)
+    # 导出**每次都跑**：它是增量的（按 msg_id 接着导），没有新行时只花几十毫秒，
+    # 而且比"猜文件时间"可靠 —— 导出一旦中断，下一次自动把它补完。
+    report.export = export_database(
+        plain,
+        export,
+        batch_size=EXPORT_BATCH,
+        include_c2c=EXPORT_INCLUDE_C2C,
+    )
+    report.exported = True
     return report
 
 
 __all__ = [
     "DEFAULT_BATCH_SIZE",
-    "DEFAULT_EXPORT_OVERLAP_SECONDS",
     "DEFAULT_HEADER_SIZE",
+    "SYNC_TABLES",
     "PrepareReport",
     "prepare_databases",
     "read_key",

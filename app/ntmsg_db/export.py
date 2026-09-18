@@ -68,7 +68,10 @@ class ExportReport:
     parse_status: dict[str, int] = field(default_factory=dict)
     failed_rows: int = 0
     last_error: str | None = None
-    since_ts: int = 0
+    # 每张表的起点（"我已经导到哪一条了"）。全量时是 0。
+    since_msg_id: dict[str, int] = field(default_factory=dict)
+    # 因为"源库看起来换了一份"而整表重导的表
+    rebuilt: list[str] = field(default_factory=list)
     watermark: int = 0
     seconds: float = 0.0
 
@@ -82,8 +85,8 @@ class ExportReport:
 
     def summary(self) -> str:
         parts = [f"写入 {self.total_written:,} 行"]
-        if self.since_ts:
-            parts.append(f"（只处理 {self.since_ts} 之后的行）")
+        if self.rebuilt:
+            parts.append(f"⚠️ 整表重导：{'、'.join(self.rebuilt)}")
         if self.parse_status:
             parts.append(
                 "正文解析：" + "、".join(f"{k} {v:,}" for k, v in sorted(self.parse_status.items()))
@@ -94,19 +97,28 @@ class ExportReport:
         return "；".join(parts)
 
 
-def _incremental_sql(select_sql: str, since_ts: int) -> tuple[str, tuple]:
-    """给上游的 SELECT 外面套一层时间过滤（`since_ts=0` 时原样返回 = 全量）。
+def _incremental_sql(select_sql: str, since_msg_id: int) -> tuple[str, tuple]:
+    """给上游的 SELECT 外面套一层 `msg_id > ?`（`since_msg_id<=0` = 全量）。
 
-    上游的语句以 `ORDER BY "40001"` 结尾，包成子查询后 SQLite 会把 WHERE 条件下推，
-    效果和改写原语句一样；这样就不必去动 `msgdb` 里的常量（保持逐字搬运）。
+    **为什么按 msg_id 而不是时间**：`msg_id`（源表的 `"40001"`）是 `INTEGER PRIMARY
+    KEY`，也就是 rowid —— 加这个条件是一条**索引区间扫描**，只读新行；而按
+    `timestamp >= ?` 要全表扫一遍（实测 77 万行 5.5 秒），而且还有"同秒后到"的
+    漏读风险（时间戳更早的新消息会被跳过）。msg_id 是单调追加的，没有这个问题。
+
+    上游语句以 `ORDER BY "40001"` 结尾，包成子查询后 SQLite 会把条件下推到主键上。
+    外层再 `ORDER BY msg_id` 一次：不依赖"子查询的 ORDER BY 会不会被保留"。
     """
-    if since_ts <= 0:
+    if since_msg_id <= 0:
         return select_sql, ()
-    return f"SELECT * FROM ({select_sql}) WHERE timestamp >= ?", (since_ts,)
+    return f"SELECT * FROM ({select_sql}) WHERE msg_id > ? ORDER BY msg_id", (int(since_msg_id),)
 
 
 def watermark(path: Path | str, table: str = "group_messages") -> int:
-    """导出库里已有的最大时间戳。没有就返回 0（报告里用）。"""
+    """导出库里已有的**最大 msg_id**（增量导出的起点）。
+
+    `msg_id` 就是源表的 rowid（`"40001"`），所以这个数是"我已经导到哪一条了"，
+    比时间戳精确：不会漏掉同秒后到的消息，也不需要"回看窗口"。
+    """
     path = Path(path)
     if not path.exists():
         return 0
@@ -119,9 +131,43 @@ def watermark(path: Path | str, table: str = "group_messages") -> int:
             ).fetchone()
             if not exists:
                 return 0
-            row = conn.execute(f'SELECT max("timestamp") FROM "{table}"').fetchone()
+            row = conn.execute(f'SELECT max("msg_id") FROM "{table}"').fetchone()
     except sqlite3.Error as exc:
         raise ExportError(f"读导出库失败 {path}：{exc}") from exc
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def source_max_id(src: Path | str, table: str) -> int:
+    """明文源库里某张表的最大 rowid（用来判断"有没有新行"）。"""
+    path = Path(src)
+    if not path.exists():
+        return 0
+    try:
+        with closing(sqlite3.connect(sqlite_uri(path, "ro"), uri=True, timeout=30.0)) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if not exists:
+                return 0
+            row = conn.execute(f'SELECT max(rowid) FROM "{table}"').fetchone()
+    except sqlite3.Error as exc:
+        raise ExportError(f"读明文库失败 {path}：{exc}") from exc
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def _source_table(label: str) -> str:
+    """导出的目标表 → 源表（上游那两张消息表）。"""
+    return "c2c_msg_table" if label == "c2c" else "group_msg_table"
+
+
+def _dest_max_id(conn: sqlite3.Connection, target: str) -> int:
+    """导出库里某张表的 `max(msg_id)`（= 已经导到哪一条了）。表不存在时返回 0。"""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (target,)
+    ).fetchone()
+    if not exists:
+        return 0
+    row = conn.execute(f'SELECT max(msg_id) FROM "{target}"').fetchone()
     return int(row[0]) if row and row[0] is not None else 0
 
 
@@ -131,14 +177,21 @@ def export_database(
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
     include_c2c: bool = True,
-    since_ts: int = 0,
-    overlap_seconds: int = 0,
+    full: bool = False,
     progress: Callable[[int, int, str], None] | None = None,
 ) -> ExportReport:
-    """`nt_msg_plain.db` → `nt_msg_export.db`（**全量**）。
+    """`nt_msg_plain.db` → `nt_msg_export.db`（**增量**，按 msg_id）。
 
-    `since_ts`/`overlap_seconds` 只在调用方明确要给一个起点时才用（正常路径不传，
-    即全量）。按时间过滤的代价见模块开头那段说明。
+    增量是"接着导出库里已有的最大 msg_id 往后导"。为什么这样安全：
+
+    * 源表的 `msg_id`（`"40001"`）就是 `INTEGER PRIMARY KEY`，**只增不改** ——
+      新消息的 id 永远比旧的大。所以"导到哪一条了"就是一个精确的游标，
+      既不会漏（不像时间戳会漏掉同秒后到的），也不需要回看窗口。
+    * 导库的写入是幂等的（主键 `msg_id`），中断了下次接着导，最多重导一批。
+
+    什么时候会**整表重导**（`report.rebuilt`）：源库的 `max(msg_id)` 比导出库里的
+    还小 —— 那说明换了一份更旧的源库（或者换了账号）。这时候继续增量只会让导出库
+    停在旧数据上，所以清空重导。想强制全量传 `full=True`（或直接删掉导出库文件）。
     """
     started = time.monotonic()
     src_path = Path(src)
@@ -148,9 +201,6 @@ def export_database(
     dst_path.parent.mkdir(parents=True, exist_ok=True)
 
     report = ExportReport(src=src_path, dst=dst_path)
-    if since_ts > 0 and overlap_seconds:
-        since_ts = max(1, since_ts - max(0, overlap_seconds))
-    report.since_ts = since_ts
 
     try:
         src_conn = sqlite3.connect(sqlite_uri(src_path, "ro"), uri=True, timeout=60.0)
@@ -199,6 +249,29 @@ def export_database(
                     else group_exporter.SELECT_COUNT_SQL
                 )
                 report.source_rows[target] = int(src_conn.execute(count_sql).fetchone()[0])
+
+                # 起点：导出库里已有的最大 msg_id（每一轮接着上一轮）
+                since = 0 if full else _dest_max_id(dst_conn, target)
+                source_max = int(
+                    src_conn.execute(
+                        f'SELECT max(rowid) FROM "{_source_table(label)}"'
+                    ).fetchone()[0]
+                    or 0
+                )
+                if since and source_max and source_max < since:
+                    logger.warning(
+                        "%s：源库最大 msg_id %s 比导出库里的 %s 还小 —— 像是换了一份更旧的"
+                        "源库（或换了账号）。整表重导一次。",
+                        target,
+                        f"{source_max:,}",
+                        f"{since:,}",
+                    )
+                    dst_conn.execute(f'DELETE FROM "{target}"')
+                    dst_conn.commit()
+                    report.rebuilt.append(target)
+                    since = 0
+                report.since_msg_id[target] = since
+
                 written = _export_one(
                     src_conn,
                     dst_conn,
@@ -206,7 +279,7 @@ def export_database(
                     select_sql=select_sql,
                     parse_row=parse_row,
                     batch_size=batch_size,
-                    since_ts=since_ts,
+                    since_msg_id=since,
                     report=report,
                     progress=progress,
                 )
@@ -217,10 +290,18 @@ def export_database(
             logger.info("建立二级索引…")
             create_indexes(dst_conn)
 
-            logger.info("重建 FTS 索引（上游的 3.export.py 也做这一步）…")
-            rebuild_fts(dst_conn)
+            # 一份新行都没写进去时，**收尾这几步全都不用做**：索引没变、FTS 没变。
+            # 这几步里 `rebuild_fts()` 是固定 5.45 秒（77 万行），而客户端每 5 分钟
+            # 就跑一轮 —— 绝大多数轮次一条新消息都没有，那 5 秒纯属白花。
+            # 有新行时仍然老老实实重建（FTS 是外部内容表，插了行不重建就会漏搜 ——
+            # 客户端自己不用 FTS，但用户可能拿导出库跑上游的 nt_msg_search.py）。
+            if report.total_written:
+                logger.info("重建 FTS 索引（上游的 3.export.py 也做这一步）…")
+                rebuild_fts(dst_conn)
+                dst_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            else:
+                logger.debug("没有新行：跳过重建 FTS 与收尾检查点")
 
-            dst_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
             # 收尾切回 DELETE：客户端是只读打开导出库的，只读连接建不了 -shm
             dst_conn.execute("PRAGMA journal_mode=DELETE;")
     except sqlite3.Error as exc:
@@ -254,13 +335,13 @@ def _export_one(
     select_sql: str,
     parse_row: Callable,
     batch_size: int,
-    since_ts: int,
+    since_msg_id: int,
     report: ExportReport,
     progress: Callable[[int, int, str], None] | None,
 ) -> int:
     """一张表：逐行解析 → 批量写。返回写入行数。"""
     insert = insert_messages_batch if target == "c2c_messages" else insert_group_messages_batch
-    sql, params = _incremental_sql(select_sql, since_ts)
+    sql, params = _incremental_sql(select_sql, since_msg_id)
     total = report.source_rows.get(target, 0)
 
     batch: list[dict] = []
