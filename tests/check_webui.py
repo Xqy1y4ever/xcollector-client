@@ -15,6 +15,14 @@ Web UI 是**唯一会写用户 `.env` 的东西**，所以它的错法都很脏�
 
 HTTP 层是真起一个服务（`ThreadingHTTPServer` 绑 127.0.0.1:0 拿随机端口），
 因为"接口能不能通"只有真发一次请求才算数。
+
+> ⚠️ **这一套在 Windows 全绿、在 Linux(CI) 上挂了**，原因值得记下来：被拒的 POST
+> 如果**不把请求体读掉**，keep-alive 连接上剩下的字节会被当成下一个请求的起始行，
+> 下一个请求就变成 **501**。所以这里有一组"被拒之后紧接着再发一个请求"的断言 ——
+> 它们不是凑数，是这个 bug 唯一能被抓到的地方。
+> 另外踩过一次"只比对自己那个读取器"：`.env` 的消费者其实是 pydantic/dotenv，
+> 值里带 `#` 时它会当注释丢掉（两边一起错就永远看不出来），所以第 3 节用**真的
+> Settings** 再读一遍。
 """
 
 from __future__ import annotations
@@ -101,15 +109,29 @@ def main() -> int:  # noqa: C901
     check_true("说明写清了为什么", "不是配置项" in text, text)
     check("再注释一次是 0 行（幂等）", envfile.comment_out_keys(["CLIENT_BATCH_SIZE"]), [])
 
-    print("\n--- 3. 拒绝不是配置项的键 / 值里有特殊字符也不怕 ---")
+    print("\n--- 3. 拒绝不是配置项的键 / 值里的特殊字符 ---")
     try:
         envfile.write_env_values({"NOT_A_FIELD": "x"})
         check_true("写非配置项 → 报错", False, "居然写进去了")
     except ValueError as exc:
         check_true("写非配置项 → 报错", "不是配置项" in str(exc), str(exc))
-    envfile.write_env_values({"CLIENT_GROUP_WHITELIST": "123456789:通知群 #1"})
-    check("带 # 和空格的备注能原样读回来",
-          envfile.read_env()["CLIENT_GROUP_WHITELIST"], "123456789:通知群 #1")
+
+    # 带 `#` / 空格的值：dotenv 会把 ` #…` 当注释丢掉，所以写的时候必须加引号。
+    # 这里用**真的 Settings** 读一遍，证明"我们写出去的、和 pydantic 读到的"一致 ——
+    # 只比对自己那个读取器是不够的（两边一起错就永远看不出来）。
+    awkward = "123456789:通知群 #1"
+    envfile.write_env_values({"CLIENT_GROUP_WHITELIST": awkward})
+    check("自己读回来是对的", envfile.read_env()["CLIENT_GROUP_WHITELIST"], awkward)
+    from app.config import Settings as _S
+
+    via_pydantic = _S(_env_file=str(env_path))
+    check("pydantic 读到的也是同一个值", via_pydantic.client_group_whitelist, awkward)
+    check("而且能解析成白名单", sorted(via_pydantic.group_whitelist_map), ["123456789"])
+    check("白名单备注里的 # 没丢", via_pydantic.group_whitelist_map["123456789"], "通知群 #1")
+
+    envfile.write_env_values({"CLIENT_ATTACHMENT_ROOT": 'C:\\a "b"\\c'})
+    check("带引号的路径也能读回来",
+          envfile.read_env()["CLIENT_ATTACHMENT_ROOT"], 'C:\\a "b"\\c')
 
     print("\n--- 4. 密钥不回显 ---")
     envfile.write_env_values({"CLIENT_TOKEN": "xc_supersecret", "CLIENT_NT_MSG_KEY": "0123456789abcdef"})
@@ -158,9 +180,15 @@ def main() -> int:  # noqa: C901
             print("\n--- 6. 写接口：必须带 X-XC-UI（跨站请求发不出来）---")
             r = c.post(f"{base}/api/config", json={"values": {"CLIENT_EXTRACTOR": "rule"}})
             check("不带头的 POST → 403", r.status_code, 403)
+            # 关键：**被拒的那次请求也把请求体读干净了**。否则 leftover 字节会被
+            # 当成下一个请求的起始行，于是下一个请求变成 501（Linux/CI 上必现）。
+            r = c.get(f"{base}/api/config")
+            check("紧接着的请求仍然正常（keep-alive 没被搞乱）", r.status_code, 200)
             r = c.post(f"{base}/api/config", headers={"Content-Type": "application/json"},
                        content='{"values":{}}')
             check("只有 Content-Type 没有头 → 403", r.status_code, 403)
+            r = c.get(f"{base}/api/config")
+            check("再一次也正常", r.status_code, 200)
 
             r = c.post(f"{base}/api/config", headers=ui_headers,
                        json={"values": {"CLIENT_EXTRACTOR": "llm", "CLIENT_TOKEN": ""}})
@@ -188,7 +216,9 @@ def main() -> int:  # noqa: C901
             last = {}
             while time.time() < deadline:
                 last = c.get(f"{base}/api/state").json()["run"]
-                if last.get("last_error"):
+                # 要同时满足"没在跑"和"留下了原因"：`cycles` 是在记完原因之后才加的，
+                # 只看 last_error 有可能在加之前就跳出循环（一条时序竞态）。
+                if last.get("last_error") and not last.get("busy"):
                     break
                 time.sleep(0.3)
             check("最后回到空闲", last.get("busy"), False)

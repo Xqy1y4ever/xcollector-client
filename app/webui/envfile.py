@@ -157,12 +157,37 @@ def comment_out_keys(keys: list[str], *, path: Path | str | None = None) -> list
 
 
 def _quote(value: str) -> str:
+    """写进 `.env` 的值。
+
+    ⚠️ **必须真的会加引号**：`.env` 的消费者是 `pydantic-settings`（走 python-dotenv），
+    而 dotenv 把 `KEY=值 # 注释` 里的 ` # 注释` 当注释丢掉 —— 于是"页面里存进去一个带
+    `#` 的值，读出来少了一半"。带引号时 dotenv 不做这个处理，所以这里按需加双引号，
+    `_unquote()` 再原样还原。
+
+    什么时候要加：含 `#`、含引号、首尾有空白、含换行（换行会破坏文件结构）。
+    """
     text = str(value).replace("\r", " ").replace("\n", " ")
-    return text
+    if text == "":
+        return ""
+    needs_quote = (
+        "#" in text
+        or '"' in text
+        or "'" in text
+        or text != text.strip()
+        or "=" in text
+    )
+    if not needs_quote:
+        return text
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _unquote(raw: str) -> str:
     text = raw.strip()
     if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
-        text = text[1:-1]
+        quote = text[0]
+        inner = text[1:-1]
+        if quote == '"':
+            # 与 `_quote()` 对应：还原转义。顺序很重要（先 \\\\ 再 \\"）。
+            inner = inner.replace('\\\\', '\\').replace('\\"', '"')
+        return inner
     return text

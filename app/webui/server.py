@@ -57,6 +57,8 @@ logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 LOG_BUFFER = 500
 UI_HEADER = "X-XC-UI"
+# 请求体的上限。这个页面的请求都是几十字节的配置值，1MB 已经很宽松了。
+MAX_BODY_BYTES = 1_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +343,12 @@ class Handler(BaseHTTPRequestHandler):
         # 本机工具：不许被别的站点嵌进 iframe，也不给任何 CORS 放行
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Cache-Control", "no-store")
+        if status >= 400:
+            # 出错就关连接：不关的话，"没读完请求体就回错"会让这个 keep-alive
+            # 连接上剩下的字节被当成下一个请求的起始行（实测表现为 501）。
+            # 请求体我们**已经**读干净了（见 `_read_json`），这里是第二道保险。
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.end_headers()
         self.wfile.write(body)
 
@@ -351,17 +359,32 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, message: str, status: int = 400) -> None:
         self._json({"error": message}, status)
 
-    def _read_json(self) -> dict:
-        """读请求体。**要求 `X-XC-UI` 头**（跨站请求发不出来，见模块说明）。"""
-        if self.headers.get(UI_HEADER) != "1":
-            raise PermissionError(f"缺少 {UI_HEADER} 头：这个接口只给自带的页面用")
+    def _read_body(self) -> bytes:
+        """把请求体**读干净**。
+
+        这一步必须在任何提前返回（权限不足、路径不对……）**之前**做：`http.server`
+        是 keep-alive 的，留下没读的字节会让下一个请求从这些字节开始解析，
+        于是下一个请求变成一个"未知方法" → **501**。这个坑在 Windows 上看不出来
+        （连接被回收得早），在 Linux/CI 上必现 —— 是 `check_webui` 在 WSL 里跑出来的。
+        """
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
+            return b""
+        if length > MAX_BODY_BYTES:
+            # 太大的请求体：读掉能读的，剩下的靠"出错就关连接"兜住
+            self.rfile.read(MAX_BODY_BYTES)
+            raise ValueError(f"请求体太大（{length} 字节）")
+        return self.rfile.read(length)
+
+    def _read_json(self) -> dict:
+        """读请求体。**要求 `X-XC-UI` 头**（跨站请求发不出来，见模块说明）。"""
+        raw = self._read_body()
+        if self.headers.get(UI_HEADER) != "1":
+            raise PermissionError(f"缺少 {UI_HEADER} 头：这个接口只给自带的页面用")
+        if not raw:
             return {}
-        if length > 1_000_000:
-            raise ValueError("请求体太大")
         try:
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            body = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError(f"请求体不是 JSON：{exc}") from exc
         return body if isinstance(body, dict) else {}
