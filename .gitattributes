@@ -4,3 +4,9 @@
 *.cmd text eol=crlf
 *.png binary
 *.jpg binary
+
+# msgdb/ 是从 nt_msg_db_util **逐字**搬过来的（见 msgdb/VENDORED.md）。
+# 这里显式关掉换行符转换，让仓库里的字节和上游一模一样 ——
+# 这样"上游升级了，把新版覆盖过来"就是一个干净的 diff，不用先分辨
+# 哪些差异是真的改动、哪些只是 CRLF/LF。
+msgdb/** -text
