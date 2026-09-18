@@ -287,6 +287,31 @@ class Mirror:
             ).fetchone()
         return int(row["m"] or 0) if row else 0
 
+    def group_seen_ts(self, group_id: str, *, exclude_msg_id: str = "") -> int | None:
+        """这个群里**见过**的、除 `exclude_msg_id` 之外最晚一条消息的时间（秒）。
+
+        用途：缺口检测要的"上一条消息的时间"。以前这个值是后端 `group_state`
+        给的，那个表是**共享**的（一个群一行，全站一张表）—— 两个客户端各写各的
+        时间线会互相把 previous 顶掉，缺口告警就会静默地漏掉。现在改成从
+        **自己的镜像**里取：这个群里我见过什么，只有我知道，也只有我关心。
+
+        用 `MAX`（而不是"比当前这条更早的最近一条"）是刻意的：补处理一条很老的
+        消息时，`MAX` 会给出更新的那条，`gap` 算出来是负的 → 不告警。否则每补一条
+        历史消息就会凭空冒出一个"缺口"。
+
+        白名单跳过的**不算**"见过"：用户已经说了他不看那个来源，再为它的沉默
+        告警是噪音（`reopen_whitelist_skips()` 会把它们放回来，那时再算）。
+        """
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT MAX(source_ts) AS m FROM message"
+                " WHERE group_id=? AND msg_id != ?"
+                "   AND NOT (state=? AND last_error LIKE 'whitelist:%')",
+                (str(group_id), str(exclude_msg_id), STATE_SKIPPED),
+            ).fetchone()
+        value = int(row["m"] or 0) if row else 0
+        return value or None
+
     def unfinished(self) -> list[MirrorRow]:
         """还没处理完的（pending/failed）—— 崩溃恢复与失败重试靠它。"""
         with closing(self._connect()) as conn:

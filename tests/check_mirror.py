@@ -32,6 +32,7 @@ from app.mirror import (
 from app.source.ntmsg import SourceMessage
 
 SCRATCH = Path(__file__).resolve().parent.parent / ".tmp-test"
+ROOT = Path(__file__).resolve().parent.parent
 
 fails: list[str] = []
 total = 0
@@ -168,6 +169,42 @@ def main() -> int:  # noqa: C901
     print("\n--- 11. 库文件真的落在指定路径（不是内存）---")
     check_true("文件存在", db.exists(), str(db))
     check_true("换个实例读到的状态一样（真的持久化了）", Mirror(db).get("1").state, STATE_DONE)
+
+    # ------------------------------------------------------------------
+    print("\n--- 12. 群里「上一条消息」的时间取自镜像（缺口检测用）---")
+    # 以前这个是后端的共享 group_state 给的：两个客户端写同一张表会互相把
+    # previous 顶掉，缺口告警就静默地漏。现在从自己的镜像里算。
+    gap_dir = ROOT / ".tmp-test" / "mirror-gap"
+    gap_dir.mkdir(parents=True, exist_ok=True)
+    gap_db = gap_dir / "gap.db"
+    if gap_db.exists():
+        gap_db.unlink()
+    gm = Mirror(gap_db)
+    check("空镜像 → 没有上一条", gm.group_seen_ts("g1"), None)
+
+    gm.claim(msg("g1-1", ts=1000, group_id="g1"))
+    gm.finish("g1-1", state=STATE_DONE)
+    gm.claim(msg("g1-2", ts=9000, group_id="g1"))
+    gm.finish("g1-2", state=STATE_DONE)
+    gm.claim(msg("g2-1", ts=50000, group_id="g2"))
+    gm.finish("g2-1", state=STATE_DONE)
+    check("取的是**这个群**里最晚的一条", gm.group_seen_ts("g1"), 9000)
+    check("别的群不影响", gm.group_seen_ts("g2"), 50000)
+    check("没见过的群 → None", gm.group_seen_ts("g3"), None)
+    check(
+        "正在处理的那条不算「上一条」（否则缺口永远是 0）",
+        gm.group_seen_ts("g1", exclude_msg_id="g1-2"),
+        1000,
+    )
+    check("只有它一条时排除掉就没上一条了", gm.group_seen_ts("g2", exclude_msg_id="g2-1"), None)
+
+    # 白名单跳过的**不算见过**：用户说了不看那个来源，再为它的沉默告警是噪音
+    gm.claim(msg("g1-3", ts=99000, group_id="g1"))
+    gm.finish("g1-3", state=STATE_SKIPPED, error="whitelist:group 群 g1 不在名单里")
+    check("白名单跳过的不算见过", gm.group_seen_ts("g1"), 9000)
+    gm.claim(msg("g1-4", ts=88000, group_id="g1"))
+    gm.finish("g1-4", state=STATE_SKIPPED, error="闲聊")
+    check("因为别的原因跳过的算见过（群里确实有消息）", gm.group_seen_ts("g1"), 88000)
 
     print()
     if fails:

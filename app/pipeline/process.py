@@ -49,16 +49,12 @@ OUTCOME_EXTRACTED = "extracted"
 OUTCOME_NOISE = "noise"
 OUTCOME_UNPARSED = "unparsed"      # 抽了，但没有证据 / 抽不出标题
 OUTCOME_DEGRADED = "degraded"      # 模型失败且规则也没兜住 —— 真盲区
-OUTCOME_SKIPPED = "skipped"        # 订阅之外的来源，压根不抽
+OUTCOME_SKIPPED = "skipped"        # 本地白名单外的来源 / 缺字段，压根不抽
 OUTCOME_ERROR = "error"            # 写不进去（后端拒绝/不可达）
 # 内容没变、已经处理过 —— 增量更新里的**正常**结果，不是异常
 OUTCOME_UNCHANGED = "unchanged"
 # 这条是对某条**已读**消息的补充：更新了那条任务，而不是新建一条
 OUTCOME_AMENDED = "amended"
-
-# 写共享层被拒（403）时专门的归类：它**不是**后端坏了，而是用户的配置和源库
-# 对不上（还没订阅这个来源）。这种情况要让用户看见，而不是混在 error 里。
-OUTCOME_NOT_SUBSCRIBED = "not_subscribed"
 
 
 @dataclass
@@ -276,14 +272,15 @@ async def process_message(
     try:
         created = await backend.create_message(raw_payload)
     except BackendRejected as exc:
-        if exc.status_code == 403:
-            # 不是后端坏了，是"这个来源我还没订阅"。这条要单独归类：
-            # 用户去网页上把它订上，下一次循环就会正常入库。
-            return Outcome(
-                result=OUTCOME_NOT_SUBSCRIBED,
-                reason=f"后端拒绝写共享层（{exc}）",
-            )
-        return Outcome(result=OUTCOME_ERROR, reason=f"写前日志被拒：{exc}")
+        # 用户令牌写自己的原文**不需要订阅任何来源**（后端按表分归属），所以
+        # 401/403 只可能是令牌本身的问题（过期、被换掉、拿错了令牌）。
+        # 这不是"等用户去订阅就好了"的状态，如实归到 error：下一轮重试并留在
+        # report 里，而不是让一批消息安静地卡在 pending 上。
+        return Outcome(
+            result=OUTCOME_ERROR,
+            reason=f"后端拒绝写原文（HTTP {exc.status_code}）：{exc}。"
+            "检查 CLIENT_TOKEN 是不是这个用户的 UserToken、有没有过期。",
+        )
     except BackendError as exc:
         return Outcome(result=OUTCOME_ERROR, reason=f"写前日志失败：{exc}")
 
@@ -292,8 +289,9 @@ async def process_message(
         return Outcome(result=OUTCOME_ERROR, reason="后端没有返回原消息 id")
 
     # 已经有通知了 → 跳过抽取。**这是"游标丢了也不心疼"的关键一步**：
-    # raw 是幂等的，所以这次 POST 顺便当了一次"这个来源我处理过吗"的查询，
-    # 而共享层的读是服务令牌专属的 —— 用户令牌下这是唯一能拿到 raw id 的办法。
+    # raw 是幂等的，所以这次 POST 顺便当了一次"这条我处理过吗"的查询 ——
+    # 客户端没有直接读原文的接口（那会跨用户），用户令牌下这是唯一拿到 raw id
+    # 的正当路径。
     if known_raw_ids and raw_id in known_raw_ids:
         return Outcome(
             result=OUTCOME_SKIPPED,
@@ -474,9 +472,10 @@ async def process_amendment(
         created = await backend.create_message(build_raw_payload(supplement))
         supplement_raw_id = str(created.get("id") or "")
     except BackendRejected as exc:
-        if exc.status_code == 403:
-            return Outcome(result=OUTCOME_NOT_SUBSCRIBED, reason=f"后端拒绝写共享层（{exc}）")
-        return Outcome(result=OUTCOME_ERROR, reason=f"写前日志（补充）被拒：{exc}")
+        return Outcome(
+            result=OUTCOME_ERROR,
+            reason=f"后端拒绝写原文（补充，HTTP {exc.status_code}）：{exc}",
+        )
     except BackendError as exc:
         return Outcome(result=OUTCOME_ERROR, reason=f"写前日志（补充）失败：{exc}")
 
@@ -634,7 +633,6 @@ __all__ = [
     "merge_amendment",
     "process_amendment",
     "OUTCOME_EXTRACTED",
-    "OUTCOME_NOT_SUBSCRIBED",
     "OUTCOME_NOISE",
     "OUTCOME_SKIPPED",
     "OUTCOME_UNPARSED",

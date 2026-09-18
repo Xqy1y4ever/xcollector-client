@@ -24,7 +24,6 @@ from .config import ConfigError, get_settings, stale_env_keys
 from .logging_setup import setup_logging
 from .run import (
     load_processed_raw_ids,
-    load_subscriptions,
     log_report,
     run_cycle,
     run_loop,
@@ -183,12 +182,19 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
 
     who = await verify_identity(backend, settings)
     user = who.get("user") or {}
-    subs = await load_subscriptions(backend)
-    print(f"  订阅（这就是过滤条件）：{len(subs)} 条")
-    for group_id, sender_id in sorted(subs)[:20]:
-        print(f"    · 群 {group_id} · 发送者 {sender_id}")
-    if not subs:
-        print("    ⚠️ 一条都没有：客户端不会入库。先在网页上（或发 /订阅）订一个来源。")
+    # 订阅是 **bot** 的过滤条件，不是客户端的：客户端读的是自己账号的聊天记录库，
+    # 收窄只有 CLIENT_GROUP_WHITELIST / CLIENT_SENDER_WHITELIST（留空 = 不限制）。
+    if settings.whitelist_active:
+        print(
+            "  本地白名单      群=%s 发送者=%s（只收窄）"
+            % (
+                ",".join(sorted(settings.group_whitelist_map)) or "（不限）",
+                ",".join(sorted(settings.sender_whitelist_map)) or "（不限）",
+            )
+        )
+    else:
+        print("  本地白名单      （没配：源库里所有来源都读）")
+    print("  订阅            不适用（订阅只影响 bot 的实时入库）")
 
     processed = await load_processed_raw_ids(backend)
     print(f"  后端已有通知的 raw id：{len(processed)} 个（只在镜像不认识某条消息时兜底）")

@@ -52,7 +52,6 @@ from .pipeline.process import (
     OUTCOME_ERROR,
     OUTCOME_EXTRACTED,
     OUTCOME_NOISE,
-    OUTCOME_NOT_SUBSCRIBED,
     OUTCOME_SKIPPED,
     OUTCOME_UNCHANGED,
     OUTCOME_UNPARSED,
@@ -77,9 +76,6 @@ _STATE_BY_OUTCOME = {
     OUTCOME_AMENDED: STATE_DONE,
     OUTCOME_NOISE: STATE_SKIPPED,
     OUTCOME_SKIPPED: STATE_SKIPPED,
-    # "订阅之外"不是这条消息的错，是配置还没配好 → 留着 pending，
-    # 用户订上之后这一轮之外的下一次还会重新看它（否则订完就永远补不上了）
-    OUTCOME_NOT_SUBSCRIBED: STATE_PENDING,
     OUTCOME_UNPARSED: STATE_DONE,   # 抽了、没证据 → 终态：重抽还是没证据
     OUTCOME_DEGRADED: STATE_DONE,   # 记成 degraded 也是终态（统计里有盲区记录）
     OUTCOME_ERROR: STATE_FAILED,    # 失败 → 下轮重试
@@ -90,7 +86,6 @@ _STATE_BY_OUTCOME = {
 class CycleReport:
     scanned: int = 0
     processed: int = 0
-    skipped_unsubscribed: int = 0
     skipped_whitelist: int = 0
     reopened: int = 0
     unchanged: int = 0
@@ -135,18 +130,6 @@ async def verify_identity(backend: BackendClient, settings: Settings) -> dict:
             user.get("display_name") or "无显示名",
         )
     return who
-
-
-async def load_subscriptions(backend: BackendClient) -> set[tuple[str, str]]:
-    """这个用户的订阅 → `{(group_id, sender_id)}`。
-
-    **这就是客户端的过滤条件**，也是和后端那份配置唯一的事实来源：
-    网页上（或 `/订阅` 指令里）订了什么，这里就读到什么。
-    """
-    subs = await backend.list_subscriptions(include_disabled=False)
-    pairs = {(str(s.get("group_id") or ""), str(s.get("sender_id") or "")) for s in subs}
-    pairs.discard(("", ""))
-    return pairs
 
 
 async def load_processed_raw_ids(backend: BackendClient) -> set[str]:
@@ -281,12 +264,17 @@ async def _maybe_gap(
     backend: BackendClient,
     settings: Settings,
     message: SourceMessage,
-    previous_last_msg_ts,
+    previous_ts_ms,
     report: CycleReport,
 ) -> None:
-    """群级缺口检测（和 bot 同一套判据）。"""
+    """缺口检测：这个群是不是静默太久了（此期间的通知可能已经永久丢失）。
+
+    `previous_ts_ms` 来自**客户端自己的镜像**（`Mirror.group_seen_ts`），
+    不是后端的 `group_state` —— 那个表是共享的，两个客户端会互相顶掉对方的时间线。
+    和 bot 的判据（间隔多久算缺口）保持一致，只是时间线换成自己看到的。
+    """
     try:
-        previous = int(previous_last_msg_ts) if previous_last_msg_ts else None
+        previous = int(previous_ts_ms) if previous_ts_ms else None
     except (TypeError, ValueError):
         previous = None
     if not previous:
@@ -326,7 +314,6 @@ async def _handle_one(
     database: SourceDatabase,
     known_raw_ids: set[str],
     report: CycleReport,
-    subscriptions: set[tuple[str, str]] | None = None,
     *,
     record: bool = True,
     allow_known_skip: bool = True,
@@ -341,12 +328,20 @@ async def _handle_one(
     `claim` 判成 `changed`（内容变了）时必须关掉它：那正是要**重新抽一遍去更新
     任务**的情况，而"后端已经有这条通知"永远成立（就是那条要更新的）——
     开着它会让补充/编辑永远不生效，而且是静默的。这个洞是 e2e 抓出来的。
-    """
-    pair = (message.group_id, message.sender_id)
 
+    ## 这里**不再**看订阅
+
+    以前这里有两道订阅门槛：整轮"没订阅就什么都不做"，以及逐条"不在订阅范围就
+    跳成 skipped"。现在都没有了：订阅是 **bot** 的东西（它的实时入库看的是订阅），
+    客户端读的是**自己账号**的聊天记录库 —— "这个来源我订阅过吗"在这个语境下
+    既表达不了它的输入，也表达不了它的权限。客户端的收窄只有一处：
+    `CLIENT_GROUP_WHITELIST` / `CLIENT_SENDER_WHITELIST`（留空 = 不限制）。
+
+    权限在后端那边是**按表**分的：客户端写的原文进 `user_raw_message`
+    （按用户），bot 写的进共享的 `raw_message`。所以这里不需要、也不该自己判订阅。
+    """
     # ---- 白名单（本地收窄；留空 = 不限制）----
-    # 放在订阅之前判：这一层是纯本地的，不用发任何请求，先砍掉不看的来源最省事。
-    if subscriptions and not settings.allows(message.group_id, message.sender_id):
+    if not settings.allows(message.group_id, message.sender_id):
         reason = settings.whitelist_reason(message.group_id, message.sender_id)
         if record:
             # 记成 skipped 并**带上 whitelist: 前缀**：前缀是标记，白名单一变就会
@@ -354,12 +349,6 @@ async def _handle_one(
             mirror.finish(message.msg_id, state=STATE_SKIPPED, error=reason)
         report.skipped_whitelist += 1
         return Outcome(result=OUTCOME_SKIPPED, reason=reason)
-
-    if subscriptions and pair not in subscriptions:
-        if record:
-            mirror.finish(message.msg_id, state=STATE_SKIPPED, error="不在订阅范围内")
-        report.skipped_unsubscribed += 1
-        return Outcome(result=OUTCOME_SKIPPED, reason="不在订阅范围内")
 
     # ---- 补充关系？----
     if settings.client_amendment_enabled:
@@ -411,11 +400,6 @@ async def _handle_one(
 
 def _finish_from_outcome(mirror: Mirror, msg_id: str, outcome: Outcome) -> None:
     state = _STATE_BY_OUTCOME.get(outcome.result, STATE_FAILED)
-    if outcome.result == OUTCOME_NOT_SUBSCRIBED:
-        # 这不是这条消息的问题，是配置还没配好 —— 原因要留在镜像里，
-        # 免得下次只看到一个没有解释的 pending
-        mirror.finish(msg_id, state=state, error=outcome.reason or "还没订阅这个来源")
-        return
     mirror.finish(
         msg_id,
         state=state,
@@ -433,34 +417,20 @@ async def run_cycle(
     mirror: Mirror | None = None,
     now: int | None = None,
 ) -> CycleReport:
-    """跑一次同步。**任何一条消息失败都不会中断整批**（错误进 report）。"""
+    """跑一次同步。**任何一条消息失败都不会中断整批**（错误进 report）。
+
+    这里**不查订阅**：订阅是 bot 的过滤条件，客户端读什么由自己的源库 + 本地白名单
+    决定（权限那一侧由后端按表保证，见 `app/run.py: _handle_one` 的说明）。
+    """
     report = CycleReport()
     moment = now_ms() if now is None else now
     attachment_resolver = resolver or AttachmentResolver(settings.resolved_attachment_root)
     store = mirror or Mirror(settings.resolved_mirror_path)
 
-    subscriptions = await load_subscriptions(backend)
-    if not subscriptions:
-        # 没有订阅 = 后端会拒绝写共享层（403）。这是配置问题，必须说清楚，
-        # 而不是让用户看到一堆没有解释的失败。
-        #
-        # ⚠️ 而且**一条都不扫、镜像也不动**。先启动客户端、再去网页上订阅是很自然的
-        # 顺序；这里要是照常扫完并把消息都标成处理过，那批存量就被这次"什么都不做"
-        # 的运行白白烧掉了（现在不再有时间窗口兜着，烧掉就是真的没了）。
-        # 留着不动，等订阅配好之后下一轮自然补上。
-        logger.warning(
-            "这个用户还没有订阅任何来源，所以这一轮什么都不做（镜像也没动）。"
-            "请先在网页上（或给机器人发 /订阅）订一个 (群, 发送者)，"
-            "下一轮就会把源库里没读过的存量补上。"
-        )
-        report.errors.append("还没有订阅任何来源，本轮未做任何事（镜像未动）")
-        return report
-
     # ---- 0) 源库要先准备好（解密 + 导出）----
     #
-    # 放在订阅检查**之后**：没有订阅时这一轮本来就什么都不做，没必要花几分钟去解一个
-    # 几个 GB 的库。也放在打开源库之前 —— 这一步失败必须让整轮停下来：带着一个
-    # 没更新成功的旧库继续跑，界面看起来一切正常，而新通知一条都没进来。
+    # 放在打开源库之前 —— 这一步失败必须让整轮停下来：带着一个没更新成功的旧库
+    # 继续跑，界面看起来一切正常，而新通知一条都没进来。
     if db is None and settings.ntmsg_pipeline_enabled:
         try:
             prepared = prepare_databases(settings)
@@ -520,7 +490,7 @@ async def run_cycle(
             seen_this_cycle.add(str(message.msg_id))
             outcome = await _handle_one(
                 message, backend, settings, attachment_resolver, store, database,
-                known_raw_ids, report, subscriptions,
+                known_raw_ids, report,
             )
             _accumulate(report, outcome)
             budget -= 1
@@ -575,7 +545,7 @@ async def run_cycle(
             try:
                 outcome = await _handle_one(
                     message, backend, settings, attachment_resolver, store, database,
-                    known_raw_ids, report, subscriptions, record=False,
+                    known_raw_ids, report, record=False,
                 )
             except Exception as exc:
                 logger.exception("处理消息失败 msg_id=%s", message.msg_id)
@@ -598,7 +568,7 @@ async def run_cycle(
         try:
             outcome = await _handle_one(
                 message, backend, settings, attachment_resolver, store, database,
-                known_raw_ids, report, subscriptions,
+                known_raw_ids, report,
                 # 内容变了就必须真的重抽一遍：这时候"后端已经有这条通知"永远成立
                 # （就是那条要更新的），开着这个捷径会让补充/编辑静默地不生效。
                 allow_known_skip=(what != "changed") and not settings.client_force_recheck,
@@ -619,22 +589,18 @@ async def run_cycle(
             tokens=outcome.tokens,
         ))
 
-        # 群状态 + 缺口检测（和 bot 同一套判据：靠"上一条消息的时间"）
+        # 缺口检测：靠**自己镜像**里这个群的上一条消息时间（不是后端的 group_state）。
+        # 与 bot 的判据一致，只是时间线换成自己看到的那条 —— 共享的 group_state 会被
+        # 别人的时间线顶掉，缺口就会静默地漏。
         if not settings.client_dry_run and outcome.result != OUTCOME_SKIPPED:
-            try:
-                group_body = await backend.upsert_group(message.group_id, None, message.ts_ms)
+            previous_ts = store.group_seen_ts(
+                message.group_id, exclude_msg_id=str(message.msg_id)
+            )
+            if previous_ts:
+                # 镜像里存的是**秒**（源库的单位），缺口判据是毫秒
                 await _maybe_gap(
-                    backend, settings, message, group_body.get("previous_last_msg_ts"), report
+                    backend, settings, message, int(previous_ts) * 1000, report
                 )
-            except BackendRejected as exc:
-                if exc.status_code == 403:
-                    logger.warning(
-                        "写群状态被拒（这个群还没有订阅记录）：group=%s", message.group_id
-                    )
-                else:
-                    logger.warning("写群状态失败 group=%s：%s", message.group_id, exc)
-            except BackendError as exc:
-                logger.warning("写群状态失败 group=%s：%s", message.group_id, exc)
 
     # ---- 2a) 没读过的：按时间正序 ----
     # 从**最老的**未读开始：补充关系里"原文"必须先于"补充"被处理，否则补充找不到
@@ -681,8 +647,6 @@ async def run_cycle(
 
 def _accumulate(report: CycleReport, outcome: Outcome) -> None:
     _add(report.outcomes, outcome.result)
-    if outcome.result == OUTCOME_NOT_SUBSCRIBED and not any("订阅" in e for e in report.errors):
-        report.errors.append(outcome.reason or "后端拒绝了共享层写入（还没订阅这个来源）")
     if outcome.result == OUTCOME_ERROR and outcome.reason:
         report.errors.append(outcome.reason)
     if outcome.result == OUTCOME_AMENDED:
@@ -703,13 +667,12 @@ def _merge(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
 def log_report(report: CycleReport) -> None:
     """把一次循环的结果打成一行（+ 出错时的明细）。"""
     logger.info(
-        "本轮：扫了 %d 条（恢复 %d，其中回看已读的 %d），跳过 %d 条没变的、%d 条订阅外的、"
+        "本轮：扫了 %d 条（恢复 %d，其中回看已读的 %d），跳过 %d 条没变的、"
         "%d 条白名单外的，更新了 %d 条任务，结果=%s",
         report.scanned,
         report.recovered,
         report.rechecked,
         report.unchanged,
-        report.skipped_unsubscribed,
         report.skipped_whitelist,
         report.amended,
         report.outcomes or {},

@@ -155,21 +155,6 @@ class BackendClient:
         """
         return await self._json("GET", "/api/me", purpose="me", retries=0)
 
-    async def list_subscriptions(self, *, include_disabled: bool = False) -> list[dict]:
-        """GET /api/subscriptions —— **这个用户的**订阅，就是客户端的过滤条件。
-
-        客户端不自己配订阅：网页/指令里配的那一份就是唯一的事实来源。
-        """
-        params = {}
-        if not include_disabled:
-            params["include_disabled"] = "false"
-        body = await self._json(
-            "GET", "/api/subscriptions", params=params or None, purpose="subscriptions"
-        )
-        if isinstance(body, dict):
-            return body.get("subscriptions") or []
-        return body or []
-
     async def list_notifications(self, *, limit: int = 2000) -> list[dict]:
         """GET /api/notifications —— 自己那份。
 
@@ -187,37 +172,25 @@ class BackendClient:
         return body or []
 
     # ------------------------------------------------------------------
-    # 共享层（写的前提是"我订阅了这个来源"，由后端把关）
+    # 原始层（写进哪一层由**令牌**决定：用户令牌 → 自己那份 user_raw_message，
+    # 服务令牌 → 共享的 raw_message。客户端不需要、也做不到写共享层）
     # ------------------------------------------------------------------
 
     async def create_message(self, payload: dict) -> dict:
-        """POST /api/messages —— 写前日志。
+        """POST /api/messages —— 写前日志（原文）。
 
-        没订阅这个来源时后端会 403，而且 detail 会说清"先订阅"。
-        客户端**不吞这个错**：它说明用户的配置和源库对不上，必须让他看见。
+        用户令牌写的原文进**他自己那层**，不需要订阅任何来源。401/403 说明令牌
+        本身有问题（比如误用了服务令牌或令牌过期），客户端**不吞这个错**：
+        它会被记成这条消息 failed 并进 report，下一轮重试。
         """
         resp = await self._write("POST", "/api/messages", json=payload, purpose="messages")
         body = resp.json()
         return body if isinstance(body, dict) else {}
 
     async def patch_message(self, raw_id: str, payload: dict) -> dict:
+        """PATCH /api/messages/{id} —— 只改自己那一层里的行（state / attachments）。"""
         resp = await self._write(
             "PATCH", f"/api/messages/{raw_id}", json=payload, purpose="messages.patch"
-        )
-        body = resp.json()
-        return body if isinstance(body, dict) else {}
-
-    async def upsert_group(self, group_id: str, group_name: str | None, last_msg_ts: int) -> dict:
-        """POST /api/groups —— 缺口检测要的"上一条消息的时间"。"""
-        resp = await self._write(
-            "POST",
-            "/api/groups",
-            json={
-                "group_id": str(group_id),
-                "group_name": group_name,
-                "last_msg_ts": int(last_msg_ts),
-            },
-            purpose="groups",
         )
         body = resp.json()
         return body if isinstance(body, dict) else {}

@@ -12,7 +12,8 @@
 
 1. **只用 UserToken 就能完整入库。** 脚本注册一个真用户、拿他的 UserToken，全程
    只用那个令牌 —— 客户端只要偷偷调了一个服务令牌专属的接口，这里就会 403。
-2. **镜像就是增量状态**：处理过的不再重看、订阅外的记终态、内容变了要重新处理。
+2. **镜像就是增量状态**：处理过的不再重看、白名单外的记终态、内容变了要重新处理。
+   判据是"读没读过"，**不是订阅**（订阅只影响 bot）。
 3. **补充要改任务，不是新建任务**：新消息引用了一条已读消息时，更新的是
    **被引用那条**（靠后端的 `(user_id, raw_message_id)` 幂等），通知总数不变。
 4. **认不出引用关系时不许猜**：如实按独立新消息处理，并把原因打出来
@@ -247,24 +248,21 @@ async def run_all() -> int:  # noqa: C901
         check("拿到的是自己", (who.get("user") or {}).get("qq"), QQ)
 
         # ----------------------------------------------------------------
-        print("\n--- 2. 还没订阅 → 本轮什么都不做，而且镜像也不动 ---")
+        print("\n--- 2. 一条订阅都没有 → 照样入库（客户端不看订阅）---")
+        # 这一节以前是"还没订阅 → 本轮什么都不做"。订阅是 bot 的过滤条件：
+        # 客户端读的是**自己账号**的聊天记录库，它要做的判断只有"这条我处理过没有"
+        # （镜像里的已读标记）+ 本地白名单。权限在后端按表分开。
         make_source_db(db_path, [
             {"msg_id": "1", "ts": BASE_TS, "text": "大家下周三前交军训心得", "content": text_of("大家下周三前交军训心得")},
         ])
+        check("这个用户没有任何订阅", sync(token, "/api/subscriptions").json()["subscriptions"], [])
         report = await run_cycle(backend, settings, db=SourceDatabase(db_path), mirror=mirror)
-        check("一条都没扫（扫了也是白扫，还会烧掉回看窗口）", report.scanned, 0)
-        check_true("报错说清了是订阅的问题", any("订阅" in e for e in report.errors), str(report.errors[:1]))
-        check("镜像里一条都没记（下一轮才能补上存量）", mirror.stats()["total"], 0)
-        check("后端里也没有通知", len(notifications(token)), 0)
+        check("扫到了（不再有「没订阅就整轮不干」）", report.scanned, 1)
+        check("抽出来了", report.outcomes.get("extracted"), 1)
+        check("没有报错", report.errors, [])
 
         # ----------------------------------------------------------------
-        print("\n--- 3. 订上之后：存量补上，镜像记成 done ---")
-        check("用**用户令牌**订阅 → 200", sync(
-            token, "/api/subscriptions", "POST", json={"group_id": GROUP, "sender_id": SENDER}
-        ).status_code, 200)
-
-        report = await run_cycle(backend, settings, db=SourceDatabase(db_path), mirror=mirror)
-        check("订了之后 → extracted", report.outcomes.get("extracted"), 1)
+        print("\n--- 3. 存量补上，镜像记成 done，原文落在**自己那一层** ---")
         check("后端里有 1 条通知", len(notifications(token)), 1)
         notif = notifications(token)[0]
         check("标题抽对了", notif.get("title"), "大家下周三前交军训心得")
@@ -272,6 +270,13 @@ async def run_all() -> int:  # noqa: C901
         row = mirror.get("1")
         check("镜像里记成 done", row.state, STATE_DONE)
         check_true("而且记下了后端的 raw_id（补充要落回它）", bool(row.raw_id), str(row.raw_id))
+        # 关键的一条：客户端写的原文**不在共享层**里。共享层是所有人订阅的群的并集，
+        # 客户端能往那儿写就等于能往所有人看到的表里塞东西。
+        check(
+            "服务令牌按 id 读这条 → 404（它在 A 自己那层，不在共享层）",
+            sync(SERVICE, f"/api/messages/{row.raw_id}").status_code,
+            404,
+        )
         first_raw_id = row.raw_id
         first_notif_id = notif["id"]
 
@@ -311,7 +316,11 @@ async def run_all() -> int:  # noqa: C901
         check("镜像被重新补起来了（下次就靠它了）", mirror.get("1").state, STATE_DONE)
 
         # ----------------------------------------------------------------
-        print("\n--- 7. 订阅之外的来源：镜像记 skipped，不当成没处理 ---")
+        print("\n--- 7. **订阅一条都没有**也照样入库（订阅只影响 bot）---")
+        # 这一节以前叫"订阅之外的来源：镜像记 skipped"，测的是客户端按后端的订阅
+        # 过滤来源。现在客户端不看订阅：它读的是自己账号的聊天记录库，权限由后端
+        # 按**表**分开（客户端写 user_raw_message，bot 写共享的 raw_message）。
+        # 所以这里反过来验：这个用户**没有任何订阅**，两条不同来源照样入库。
         make_source_db(db_path, [
             {"msg_id": "10", "ts": BASE_TS + 200, "group": GROUP2, "text": "下周一交实验报告", "content": text_of("下周一交实验报告")},
             {"msg_id": "11", "ts": BASE_TS + 240, "sender": "19999", "text": "明天上午交材料", "content": text_of("明天上午交材料")},
@@ -321,11 +330,13 @@ async def run_all() -> int:  # noqa: C901
         settings2 = make_settings(token, db_path, client_mirror_path=str(mirror2_path))
         backend2 = BackendClient(settings2)
         try:
+            subs = sync(token, "/api/subscriptions").json()["subscriptions"]
+            check("先确认这个用户一条订阅都没有", subs, [])
             report = await run_cycle(backend2, settings2, db=SourceDatabase(db_path), mirror=mirror2)
-            check("两条都跳过了", report.skipped_unsubscribed, 2)
-            check("订阅外的也记进了镜像", mirror2.get("10").state, STATE_SKIPPED)
-            check("同一个群里没订的发送者也跳过", mirror2.get("11").state, STATE_SKIPPED)
-            check("通知数没变", len(notifications(token)), 2)
+            check("两条都抽了（订阅不是客户端的门槛）", report.outcomes.get("extracted"), 2)
+            check("镜像里也都记成 done", (mirror2.get("10").state, mirror2.get("11").state), (STATE_DONE, STATE_DONE))
+            check("后端多了 2 条通知", len(notifications(token)), 4)
+            check("仍然一条订阅都没有（客户端不会替用户去订阅）", sync(token, "/api/subscriptions").json()["subscriptions"], [])
         finally:
             await backend2.close()
 
@@ -546,7 +557,7 @@ async def run_all() -> int:  # noqa: C901
         mirror9_path = SCRATCH / f"mirror9-{RUN}.db"
         db_wl = SCRATCH / f"e2e-wl-{RUN}.db"
         mirror9 = Mirror(mirror9_path)
-        # 白名单里放一个**别的**群 → 这条明明订阅了的来源会被本地收窄挡下
+        # 白名单里放一个**别的**群 → 本地收窄把这条挡下
         settings9 = make_settings(
             token, db_wl, client_mirror_path=str(mirror9_path),
             client_group_whitelist="199999999",

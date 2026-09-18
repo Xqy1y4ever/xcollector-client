@@ -73,7 +73,7 @@ BACKEND_BASE_URL=http://127.0.0.1:8000
 |---|---|---|
 | `CLIENT_EXTRACTOR` | `rule` | `rule`（不花钱）/ `llm` / `both` |
 | `LLM_API_BASE` / `LLM_MODEL` / `LLM_API_KEY` | DeepSeek | `CLIENT_EXTRACTOR` 用 `llm`/`both` 时才需要 |
-| `CLIENT_GROUP_WHITELIST` / `CLIENT_SENDER_WHITELIST` | 空 | **只做收窄，不做开关**：留空 = 不额外限制（真正的过滤条件是你在后端配的订阅）。格式与 bot 相同 |
+| `CLIENT_GROUP_WHITELIST` / `CLIENT_SENDER_WHITELIST` | 空 | **只做收窄，不做开关**：留空 = 全都读（客户端不看后端订阅）。格式与 bot 相同 |
 | `CLIENT_POLL_SECONDS` | `300` | `--loop` 的轮询间隔 |
 | `CLIENT_MAX_MESSAGES_PER_CYCLE` / `CLIENT_BATCH_SIZE` | `500` / `200` | **一轮读多少**；不决定读哪些（没读过的都会读到，见下） |
 | `CLIENT_MIRROR_PATH` | 源库旁边 | 客户端自己的状态库（已读标记 + 内容指纹）。**别删**，删了会把整个源库重读一遍 |
@@ -149,9 +149,12 @@ python -m app.main --status
 ```
 
 它会打印：后端可达性与身份（是不是 UserToken）、源库路径与行数、镜像库状态、
-**还有多少条没读过**（判据是镜像里的已读标记，不是时间）、
-**你在后端配的订阅**（订阅是真正的过滤条件，一条都没有 = 什么都不会入库）、
+**还有多少条没读过**（判据是镜像里的已读标记，不是时间）、本地白名单，
 以及源表有没有序号列（决定"回复改期"能不能落到原任务上）。
+
+> **订阅与本客户端无关**：订阅是 bot 的过滤条件（决定它给谁抽），客户端读的是
+> **你自己账号**的聊天记录库。收窄只有 `CLIENT_GROUP_WHITELIST` /
+> `CLIENT_SENDER_WHITELIST`，留空 = 全都读。
 
 ## 它按什么决定"读哪些消息"
 
@@ -163,10 +166,20 @@ python -m app.main --status
 把最近这段**已读**的消息重看一遍、比对内容指纹，用来发现"消息被编辑过"。
 
 代价说清楚：**第一轮会把源库里所有群消息过一遍**（几十万条）。这是刻意的 ——
-订阅外的消息会被记成 `skipped`（很便宜，不调模型），一轮之后就不再重复读。
+白名单外的消息会被记成 `skipped`（很便宜，不调模型），一轮之后就不再重复读。
 想少读一点，用 `CLIENT_GROUP_WHITELIST` / `CLIENT_SENDER_WHITELIST` 收窄。
 一轮读多少由 `CLIENT_MAX_MESSAGES_PER_CYCLE` 控制，所以积压是分多轮读完的，
 `--status` 里的"没读过的消息"会告诉你还剩多少。
+
+## 和后端的关系
+
+客户端用**某个用户的 UserToken**，写的原文进**他自己那一层**
+（后端的 `user_raw_message`）；共享层（`raw_message` / `group_state`）只由 bot 写。
+所以：
+
+- 客户端**不需要**、也**做不到**订阅任何来源；
+- 也读不到别人的东西（后端按 `user_id` 分表，越权在 SQL 层面不可能发生）；
+- 缺口检测用的"这个群上一条消息的时间"取自**自己的镜像**，不看后端的共享群状态。
 
 ## 已知边界
 
