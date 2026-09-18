@@ -1,0 +1,8 @@
+httpx>=0.27,<1.0
+pydantic>=2.7,<3.0
+pydantic-settings>=2.3,<3.0
+# 时区数据库。**Windows 上必需**：`zoneinfo.ZoneInfo("Asia/Shanghai")` 在 Windows
+# 上找不到系统 tzdata 目录，于是 DIGEST_TZ 会静默退回 UTC+8（Asia/Shanghai 恰好
+# 全年 UTC+8，所以结果是"碰巧对"，但日志里会一直刷警告，而用户配一个带夏令时的
+# 时区就会真的算错）。Linux/macOS 上它只是一个更保险的兜底。
+tzdata>=2024.1

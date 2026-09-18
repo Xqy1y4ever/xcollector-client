@@ -1,0 +1,38 @@
+name: Self-checks
+
+# 只跑**离线**自检：源库读取、相对时间解析、地点提取。
+# 这三个都不联网、不需要后端，所以可以在 CI 里稳定地跑。
+#
+# 端到端那个（tests/check_pipeline_e2e.py）需要先起一个后端，所以没放这里 ——
+# 部署/发版前请在本机按 README 的「自检」一节跑一遍。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      # 这两个文件和 xcollector-bot 里的同名文件是**逐字复制**的关系。
+      # 在 CI 里跑它们，就是为了在两边漂移时立刻红。
+      - name: 相对时间解析（与 bot 共用同一套用例）
+        run: python -m tests.check_timeparse
+
+      - name: 地点提取（与 bot 共用同一套用例）
+        run: python -m tests.check_location
+
+      - name: 源库读取器
+        run: python -m tests.check_source_db
