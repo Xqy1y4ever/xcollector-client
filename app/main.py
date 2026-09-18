@@ -54,14 +54,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> int:
     """自检 + 现状。**一个写请求都不发。**"""
+    from .mirror import Mirror
+
     print("=== 配置 ===")
     print(f"  后端            {settings.backend_base}")
     print(f"  令牌            {'UserToken' if settings.is_user_token else '⚠️ 不是 UserToken（可能是服务令牌）'}")
     print(f"  源库            {settings.resolved_db_path}")
+    print(f"  镜像库          {settings.resolved_mirror_path}")
     print(f"  附件根目录      {settings.resolved_attachment_root or '（未配置，附件只能留远程地址）'}")
     print(f"  抽取器          {settings.client_extractor}")
     print(f"  轮询间隔        {settings.client_poll_seconds}s")
-    print(f"  游标键          {settings.cursor_name}")
+    print(f"  回看窗口        {settings.client_recheck_overlap_hours}h（识别内容改动的范围）")
+    print(
+        f"  补充关系        {'开' if settings.client_amendment_enabled else '关'}"
+        f"（只认 {settings.client_amendment_max_age_hours}h 之内的引用）"
+    )
 
     print("\n=== 源库 ===")
     try:
@@ -72,8 +79,30 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
     print(f"  表 {info['table']}，共 {info['rows']} 行")
     if info["absent"]:
         print(f"  ⚠️ 缺列（会降级使用）：{info['absent']}")
+    seq_col = db.seq_column()
+    print(
+        "  群内序号列      "
+        + (
+            f"{seq_col} → 能确定性地解析「这条在回复哪一条」"
+            if seq_col
+            else "**没有** → 认不出引用关系，引用了别人的消息会按独立新消息处理"
+            "（源表缺 40003/seq 这一类列，见 README）"
+        )
+    )
     latest = db.latest()
     print(f"  最新一条的时间戳：{latest[0] if latest else '（空库）'}")
+
+    print("\n=== 镜像库（客户端自己的状态）===")
+    mirror = Mirror(settings.resolved_mirror_path)
+    stats = mirror.stats()
+    print(f"  共 {stats['total']} 条，状态 {stats['by_state'] or {}}")
+    print(f"  补充关系 {stats['amendments']} 条")
+    print(f"  水位线（已处理完的最大时间戳）：{mirror.watermark() or '（还没有）'}")
+    unfinished = mirror.unfinished()
+    if unfinished:
+        print(f"  ⚠️ 有 {len(unfinished)} 条没处理完（下一轮会重试）")
+        for row in unfinished[:5]:
+            print(f"      · {row.msg_id}  state={row.state}  error={row.last_error or '-'}")
 
     print("\n=== 后端 ===")
     health = await backend.health()
@@ -91,10 +120,7 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
         print("    ⚠️ 一条都没有：客户端不会入库。先在网页上（或发 /订阅）订一个来源。")
 
     processed = await load_processed_raw_ids(backend)
-    print(f"  已有通知的 raw id：{len(processed)} 个（游标丢失时靠它跳过重复抽取）")
-
-    cursor = await backend.get_cursor(settings.cursor_name)
-    print(f"  当前游标：{cursor or '（还没有，下次会按 initial_lookback_hours 回扫）'}")
+    print(f"  后端已有通知的 raw id：{len(processed)} 个（只在镜像不认识某条消息时兜底）")
     print(f"\n  用户：{user.get('qq')}（{user.get('id')}）")
     return 0
 
@@ -108,12 +134,25 @@ async def run_once(backend: BackendClient, settings, *, since_hours: int | None 
         return 2
 
     if since_hours is not None:
-        # 显式要重扫：把游标设到那个时间点（只影响这一次，因为它紧接着会被覆盖）
-        from .utils import now_ms
-
-        cursor_ts = (now_ms() - int(since_hours) * 3600 * 1000) // 1000
-        logger.info("按 --since-hours=%s 从 %s 开始重扫（会覆盖游标）", since_hours, cursor_ts)
-        await backend.put_cursor(settings.cursor_name, {"ts": cursor_ts, "msg_id": "", "force": True})
+        # `--since-hours N` = 把扫描起点往前推到 N 小时前重看一遍。
+        #
+        # 镜像里已经有状态的消息**不会被当成新的**（内容没变就跳过），所以它的
+        # 真正用途是：**内容被改过**的消息（超出回看窗口的那些）也要重新处理一遍。
+        # 实现方式是临时把回看窗口放大到 N 小时，而不是去动镜像 ——
+        # 镜像记的是事实（每一条处理过没有），不该被一次调用改写。
+        logger.info(
+            "按 --since-hours=%s 把回看窗口临时放大到 %s 小时（重新检查这个范围内的内容改动）",
+            since_hours,
+            since_hours,
+        )
+        settings = settings.model_copy(
+            update={
+                "client_recheck_overlap_hours": float(since_hours),
+                # 同时关掉"后端已经有这条通知就跳过抽取"的捷径 ——
+                # 否则镜像被删过之后，改过的老消息永远更新不了
+                "client_force_recheck": True,
+            }
+        )
 
     report = await run_cycle(backend, settings, db=db, resolver=AttachmentResolver(settings.resolved_attachment_root))
     log_report(report)

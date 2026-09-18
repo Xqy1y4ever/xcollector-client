@@ -61,6 +61,35 @@ class Settings(BaseSettings):
     # 找不到字节时怎么记：`url`（只留 CDN 地址，可能是死链）/ `skip`（不记附件）
     client_missing_attachment: Literal["url", "skip"] = "url"
 
+    # ---------------- 镜像库（客户端自己的状态） ----------------
+    # 客户端**自己**维护一份 SQLite，只记「这条源消息处理过没有」+ 它的内容指纹。
+    # 增量就靠它，不再依赖后端里的游标：
+    #   不在镜像里 → 新消息，处理
+    #   在、内容没变、已处理 → 跳过（零成本）
+    #   在、**内容变了** → 重新处理（后端幂等会把原来那条任务更新掉）
+    #   在、状态 pending/failed → 重试（这就是恢复队列）
+    # 留空 = 放在源库旁边（`<源库>.mirror.db`）。
+    client_mirror_path: str = ""
+    # 增量扫描时往回多看的时长（小时）。源库按时间追加，但同一秒里可能后到，
+    # 而"消息被编辑/补充"更是发生在任意更早的位置 —— 回看窗口就是这类改动的
+    # 识别范围。窗口越大越不容易漏，代价是每轮多读一点。
+    client_recheck_overlap_hours: float = 2.0
+    # 回复/引用里，"被引用对象"可能装在这些键上（逗号分隔）。默认值来自
+    # nt_msg_db_util 的群字段文档（47402 与群内序号匹配）。留空 = 用默认那组。
+    client_quote_keys: str = ""
+    # 只有**最近这么多小时**内处理过的消息才接受"被补充"。更早的引用按新消息
+    # 处理：三个月前那条通知的回复，几乎一定是另一件事。
+    client_amendment_max_age_hours: float = 72.0
+    # 要不要把"新消息引用了某条已读消息"当成**补充**（更新那条任务而不是新建一条）。
+    # 关掉就退化成"每条消息各建一条任务"。
+    client_amendment_enabled: bool = True
+    # 强制重新抽取（`--since-hours` 会打开它）。
+    #
+    # 平时会用"后端已经有这条通知"来跳过抽取（省模型的钱）。但那个捷径在一种情况下
+    # 是错的：镜像被删过、而你正好**改过**某条老消息的内容 —— 这时快照是新的、
+    # 后端有旧内容的任务，捷径一开就永远不更新。强制模式关掉捷径，按内容重抽一遍。
+    client_force_recheck: bool = False
+
     # ---------------- 抽取 ----------------
     client_extractor: Literal["rule", "llm", "both"] = "rule"
     llm_api_base: str = "https://api.deepseek.com/v1"
@@ -96,17 +125,32 @@ class Settings(BaseSettings):
     client_log_level: str = "INFO"
     client_log_preview_chars: int = 60
 
-    # ---------------- 游标 ----------------
-    # 游标存在后端的 bot_state 里（按用户隔离），所以换机器/重装都不会丢。
-    # 丢了也不是灾难：会退回到 client_initial_lookback_hours 重扫，而重复的通知
-    # 由后端的 (user_id, raw_message_id) 幂等键挡住，不会重复入库。
-    client_cursor_namespace: str = "client_cursor"
-    # 游标键：默认用导出库的绝对路径。同一个用户读多个库时，每个库各有一条游标。
-    client_cursor_key: str = ""
+
+    # ---------------- 游标（已废弃） ----------------
+    # 这里原本还有一个"把游标存在后端 bot_state 里"的配置（CLIENT_CURSOR_NAMESPACE /
+    # CLIENT_CURSOR_KEY）。镜像库出现之后它被删掉了：水位线表达不了"这一条处理好了
+    # 没有"，也表达不了"这一条的内容变了"，而这两件事恰恰是这套系统最要紧的。
 
     @property
     def backend_base(self) -> str:
         return self.backend_base_url.rstrip("/")
+
+    @property
+    def resolved_mirror_path(self) -> Path:
+        """镜像库路径。默认放在源库旁边 —— 一个源库对应一份状态，天然不会串。"""
+        if self.client_mirror_path.strip():
+            return Path(self.client_mirror_path).expanduser()
+        source = self.resolved_db_path
+        return source.with_name(source.name + ".mirror.db")
+
+    @property
+    def quote_keys(self) -> tuple[str, ...]:
+        raw = (self.client_quote_keys or "").replace("，", ",").strip()
+        if not raw:
+            from .source.ntmsg import DEFAULT_QUOTE_KEYS
+
+            return tuple(DEFAULT_QUOTE_KEYS)
+        return tuple(part.strip() for part in raw.split(",") if part.strip())
 
     @property
     def tz(self) -> tzinfo:
@@ -151,15 +195,6 @@ class Settings(BaseSettings):
         """是不是用户令牌。空令牌（本地开发）按"不校验"处理，也允许。"""
         return not self.client_token or self.client_token.startswith("xc_")
 
-    @property
-    def cursor_name(self) -> str:
-        """这个源库的游标键。默认用绝对路径 —— 同一个用户读多个库时各有一条。"""
-        if self.client_cursor_key.strip():
-            return self.client_cursor_key.strip()
-        try:
-            return str(self.resolved_db_path.resolve())
-        except OSError:
-            return self.client_db_path or "default"
 
 
 @lru_cache(maxsize=1)

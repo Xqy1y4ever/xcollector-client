@@ -51,6 +51,10 @@ OUTCOME_UNPARSED = "unparsed"      # 抽了，但没有证据 / 抽不出标题
 OUTCOME_DEGRADED = "degraded"      # 模型失败且规则也没兜住 —— 真盲区
 OUTCOME_SKIPPED = "skipped"        # 订阅之外的来源，压根不抽
 OUTCOME_ERROR = "error"            # 写不进去（后端拒绝/不可达）
+# 内容没变、已经处理过 —— 增量更新里的**正常**结果，不是异常
+OUTCOME_UNCHANGED = "unchanged"
+# 这条是对某条**已读**消息的补充：更新了那条任务，而不是新建一条
+OUTCOME_AMENDED = "amended"
 
 # 写共享层被拒（403）时专门的归类：它**不是**后端坏了，而是用户的配置和源库
 # 对不上（还没订阅这个来源）。这种情况要让用户看见，而不是混在 error 里。
@@ -366,6 +370,188 @@ async def _patch_state(
         logger.warning("更新 raw 状态失败 raw=%s state=%s：%s", raw_id, state, exc)
 
 
+# ---------------------------------------------------------------------------
+# 补充：新消息在补充一条**已读**消息 → 改那条任务，而不是新建一条
+# ---------------------------------------------------------------------------
+
+# 合并后的证据/摘要长度上限。超过就截断并说明 —— 无上限地拼会把通知撑爆，
+# 而通知是给人看的（前端也按固定字段渲染）。
+_MERGED_EVIDENCE_MAX = 600
+_MERGED_SUMMARY_MAX = 300
+
+
+def merge_amendment(original: dict | None, supplement: dict | None) -> dict | None:
+    """把「原通知」和「补充」两次抽取的结果合并成一条。
+
+    合并规则刻意简单、可解释：
+
+      - **截止时间以补充为准**：补充说"改到周五"就是周五。这是用户最关心的字段，
+        而且"补充"这个动作本身通常就是在改时间。
+      - 原文的 due_confidence/candidates/conflict 保留，但把冲突标出来 ——
+        两次结果不一致时用户必须能看见，而不是安静地采用后一个。
+      - summary 追加一句"补充：…"；evidence **逐段拼接**（每一段仍是原文逐字复制，
+        所以"证据必须能回到原文"这条硬约束没有被破坏）。
+      - 补充没抽出东西（None）时**不动**原结果：一句闲聊式的回复不该清掉已有的截止时间。
+
+    `original` 为 None 表示原消息当初没抽成通知（比如被判成闲聊）—— 那这次补充
+    抽出来的就是**新**的一条任务，调用方要按新建处理，不能往一个不存在的任务上写。
+    """
+    if original is None:
+        return supplement
+    if supplement is None:
+        return original
+
+    merged = dict(original)
+    sup_due = supplement.get("due_at")
+    if sup_due is not None:
+        if original.get("due_at") is not None and int(original["due_at"]) != int(sup_due):
+            merged["conflict"] = True
+            merged["due_confidence"] = min(float(supplement.get("due_confidence") or 0.0), 0.5)
+            logger.info(
+                "补充改了截止时间：%s → %s（已标 conflict，让人看得见这次改动）",
+                original.get("due_at"),
+                sup_due,
+            )
+        merged["due_at"] = sup_due
+        merged["due_text"] = supplement.get("due_text") or merged.get("due_text")
+        merged["due_confidence"] = float(supplement.get("due_confidence") or 0.0)
+    if supplement.get("location"):
+        merged["location"] = supplement["location"]
+    if supplement.get("title") and not merged.get("title"):
+        merged["title"] = supplement["title"]
+
+    sup_summary = (supplement.get("summary") or "").strip()
+    if sup_summary:
+        base = (merged.get("summary") or "").strip()
+        merged["summary"] = (f"{base} 补充：{sup_summary}" if base else sup_summary)[:_MERGED_SUMMARY_MAX]
+
+    sup_evidence = (supplement.get("evidence") or "").strip()
+    if sup_evidence:
+        base = (merged.get("evidence") or "").strip()
+        merged["evidence"] = (f"{base}\n补充：{sup_evidence}" if base else sup_evidence)[
+            :_MERGED_EVIDENCE_MAX
+        ]
+
+    merged["candidates"] = list(original.get("candidates") or []) + list(
+        supplement.get("candidates") or []
+    )
+    merged["tokens"] = int(original.get("tokens") or 0) + int(supplement.get("tokens") or 0)
+    # extractor/model 记成"补充"这一次的：读的人要能看出最后这次是谁抽的
+    merged["extractor"] = supplement.get("extractor") or merged.get("extractor")
+    merged["model"] = supplement.get("model") or merged.get("model")
+    merged["amended"] = True
+    return merged
+
+
+async def process_amendment(
+    supplement: SourceMessage,
+    original: SourceMessage,
+    backend: BackendClient,
+    settings: Settings,
+    *,
+    original_raw_id: str,
+    known_raw_ids: set[str] | None = None,
+) -> Outcome:
+    """把「supplement 补充了 original」落到后端：**更新 original 那条任务**。
+
+    做法是两次独立抽取再合并，而不是把两段文字拼起来抽一次 —— 因为相对时间
+    （"下周三前"）必须以**各自消息的发送时间**为锚点。拼起来抽的话，原文那句
+    "下周三前"会被按补充的时间重新解释，算出来就是一个错的截止时间 ——
+    而错的截止时间比没有截止时间危害更大。
+
+    顺序（每一步都对应一条可追溯的痕迹）：
+
+      1. 把补充这条**按它自己的 msg_id** 写进原始层（证据链要留得住）；
+      2. 分别抽取原文与补充（各自锚定自己的发送时间）；
+      3. 合并（见 `merge_amendment`）；两边都没抽出东西 → 这条补充不改变任务；
+      4. `POST /api/notifications` 用**原文的 raw id** → 后端按
+         `(user_id, raw_message_id)` 幂等，于是命中原来那行、只覆盖机器字段。
+         **人工修正不会被冲掉**（这是后端早就守着的规则）。
+    """
+    # 1) 补充本身也要进原始层：否则"这条通知是怎么被改的"就查不到了
+    supplement_raw_id = ""
+    try:
+        created = await backend.create_message(build_raw_payload(supplement))
+        supplement_raw_id = str(created.get("id") or "")
+    except BackendRejected as exc:
+        if exc.status_code == 403:
+            return Outcome(result=OUTCOME_NOT_SUBSCRIBED, reason=f"后端拒绝写共享层（{exc}）")
+        return Outcome(result=OUTCOME_ERROR, reason=f"写前日志（补充）被拒：{exc}")
+    except BackendError as exc:
+        return Outcome(result=OUTCOME_ERROR, reason=f"写前日志（补充）失败：{exc}")
+
+    # 2) 两次独立抽取
+    orig_result, orig_degraded, orig_tokens = await extract(original, settings)
+    sup_result, sup_degraded, sup_tokens = await extract(supplement, settings)
+    tokens = orig_tokens + sup_tokens
+    degraded = orig_degraded or sup_degraded
+
+    if sup_result is None and orig_result is None:
+        # 两边都没抽出东西：这条补充不构成"对任务的修改"。如实记下来，
+        # 不往任务上写任何东西。
+        return Outcome(
+            result=OUTCOME_NOISE,
+            raw_id=supplement_raw_id,
+            tokens=tokens,
+            reason="补充本身没有抽出内容，原消息也没有任务 —— 不改动任何任务",
+        )
+
+    merged = merge_amendment(orig_result, sup_result)
+    if merged is None:
+        return Outcome(result=OUTCOME_NOISE, raw_id=supplement_raw_id, tokens=tokens)
+
+    if orig_result is None:
+        # 原来那条根本没有任务（当初判成闲聊）→ 这是一条**新**任务，
+        # 而且不能往原文头上写（那会把一条闲聊变成任务，还改错了归属）。
+        payload = build_notification_payload(supplement_raw_id, supplement, merged)
+        if payload is None:
+            return Outcome(
+                result=OUTCOME_UNPARSED,
+                raw_id=supplement_raw_id,
+                tokens=tokens,
+                reason="补充抽出来但没有证据，已拒绝建条",
+            )
+        try:
+            await backend.create_notification(payload)
+        except BackendError as exc:
+            return Outcome(result=OUTCOME_ERROR, raw_id=supplement_raw_id, reason=f"建条失败：{exc}")
+        await _patch_state(backend, supplement_raw_id, OUTCOME_EXTRACTED)
+        return Outcome(
+            result=OUTCOME_EXTRACTED,
+            raw_id=supplement_raw_id,
+            title=payload.get("title"),
+            due_at=payload.get("due_at"),
+            due_text=payload.get("due_text"),
+            tokens=tokens,
+            reason=f"补充（原文当初没抽成任务）：按新任务建条",
+        )
+
+    payload = build_notification_payload(original_raw_id, original, merged)
+    if payload is None:
+        return Outcome(
+            result=OUTCOME_UNPARSED,
+            raw_id=supplement_raw_id,
+            tokens=tokens,
+            reason="合并后没有证据，已拒绝更新",
+        )
+    try:
+        await backend.create_notification(payload)
+    except BackendError as exc:
+        return Outcome(result=OUTCOME_ERROR, raw_id=supplement_raw_id, reason=f"更新任务失败：{exc}")
+
+    return Outcome(
+        result=OUTCOME_AMENDED,
+        raw_id=original_raw_id,
+        title=payload.get("title"),
+        due_at=payload.get("due_at"),
+        due_text=payload.get("due_text"),
+        due_confidence=float(payload.get("due_confidence") or 0.0),
+        tokens=tokens,
+        reason=f"补充了 {original.msg_id}（已更新那条任务，不是新建）",
+    )
+
+
+
 async def _upload_attachments(
     message: SourceMessage,
     backend: BackendClient,
@@ -442,7 +628,11 @@ async def _upload_attachments(
 
 __all__ = [
     "OUTCOME_DEGRADED",
+    "OUTCOME_AMENDED",
     "OUTCOME_ERROR",
+    "OUTCOME_UNCHANGED",
+    "merge_amendment",
+    "process_amendment",
     "OUTCOME_EXTRACTED",
     "OUTCOME_NOT_SUBSCRIBED",
     "OUTCOME_NOISE",

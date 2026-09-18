@@ -42,7 +42,7 @@ import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -79,10 +79,38 @@ class SourceMessage:
     attachments: list[dict] = field(default_factory=list)
     parse_status: str | None = None
     raw_content: dict | None = None
+    # 这条消息是回复/引用时，被引用对象的**原始标识值**（可能是消息 id，
+    # 也可能是群内序号 —— 两者形状不同，所以这里不猜，交给上层去试）。
+    quote_ref: str | None = None
+    # 群内消息序号（nt_msg_db_util 文档里的 `40003`）。**导出表当前没有这一列**，
+    # 所以默认是 None；有这一列时"回复 → 被回复的那条"才能确定性地解析出来。
+    seq: str | None = None
 
     @property
     def ts_ms(self) -> int:
         return int(self.timestamp) * 1000
+
+
+# 回复/引用里可能装着"被引用对象"的键名。
+#
+# 依据是 nt_msg_db_util 的群字段文档：
+#   47402 与同一会话的 40003 群内消息序号高度匹配 → 适合当"回复目标"读
+#   47422 未与主表 40001 匹配 → 只是内部来源 ID，**不能**当消息 id 用
+# 另外几个是同义命名，遇上就一起认（多认一个键不会造成错判，
+# 因为解析出来后还要在镜像里真的命中某一条才作数）。
+DEFAULT_QUOTE_KEYS = (
+    "47402",
+    "47422",
+    "reply_seq",
+    "quoted_seq",
+    "quote_seq",
+    "reply_id",
+    "quoted_msg_id",
+    "quote_id",
+)
+
+# 群内序号列的候选名（导出表里有就用，没有就明说解析不了）
+SEQ_COLUMN_CANDIDATES = ("40003", "seq", "msg_seq", "message_seq")
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -150,6 +178,62 @@ def attachments_from_content(content: dict | None) -> list[dict]:
 
     walk(content)
     return out
+
+
+def quote_ref_from_content(content: dict | None, keys: Sequence[str] = DEFAULT_QUOTE_KEYS) -> str | None:
+    """从 `content` JSON 里找出"这条消息在回复哪一条"的标识值。
+
+    **只找，不解释**：返回的值可能是消息 id，也可能是群内序号，形状不一样。
+    解释留给上层（先当消息 id 在镜像里找，找不到再按序号解析），因为把这两种
+    混在一起猜会得到一个"看起来对、其实指错任务"的结果 —— 那比不做还糟。
+
+    **统一转成字符串**：`content` 是想保留原始 wire 值的（文档明确要求未知
+    length-delimited 字段保留为 bytes），所以同一个语义字段在不同消息里可能是
+    整数也可能是字符串；这里统一成十进制字符串，免得 `47402` 一会儿是 int
+    一会儿是 str，让上层比不出来。
+    """
+    if not isinstance(content, dict):
+        return None
+    wanted = {str(k) for k in keys}
+    found: str | None = None
+
+    def walk(node: Any) -> None:
+        nonlocal found
+        if found is not None:
+            return
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+            return
+        if not isinstance(node, dict):
+            return
+        for key, value in node.items():
+            if str(key) in wanted and isinstance(value, (int, str)) and not isinstance(value, bool):
+                text = str(value).strip()
+                if text and text.lower() not in ("none", "null", "0", ""):
+                    found = text
+                    return
+        for value in node.values():
+            walk(value)
+
+    walk(content)
+    return found
+
+
+def _first_present_key(columns: set[str], candidates: Sequence[str]) -> str | None:
+    """列名里第一个存在的候选（只看名字，不取值）。"""
+    for name in candidates:
+        if name in columns:
+            return name
+    return None
+
+
+def _first_present(row: Any, keys: set[str], candidates: Sequence[str]) -> str | None:
+    """从一行里取第一个存在的候选列的值（统一成字符串）。"""
+    for name in candidates:
+        if name in keys and row[name] is not None and str(row[name]).strip():
+            return str(row[name]).strip()
+    return None
 
 
 class SourceDatabase:
@@ -307,7 +391,63 @@ class SourceDatabase:
             attachments=attachments_from_content(content),
             parse_status=str(row["parse_status"]) if "parse_status" in keys and row["parse_status"] else None,
             raw_content=content,
+            quote_ref=quote_ref_from_content(content),
+            seq=_first_present(row, keys, SEQ_COLUMN_CANDIDATES),
         )
+
+    def fetch_by_ids(self, msg_ids: Iterable[str]) -> dict[str, "SourceMessage"]:
+        """按 msg_id 精确取若干条（重试 pending/failed 的那些靠它）。
+
+        用 id 取而不是"从头再扫一遍"：失败的消息可能落在很久以前，重扫一遍
+        代价太大，而按主键取是常数级的。
+        """
+        ids = [str(i) for i in msg_ids]
+        if not ids:
+            return {}
+        out: dict[str, SourceMessage] = {}
+        with closing(self._connect()) as conn:
+            if not self._columns:
+                self._columns = _column_names(conn, self._table)
+            select = [c for c in ("msg_id", "timestamp", *OPTIONAL_COLUMNS, "seq", *SEQ_COLUMN_CANDIDATES)
+                      if c in self._columns]
+            select = list(dict.fromkeys(select))  # 去重但保序
+            for start in range(0, len(ids), 500):
+                chunk = ids[start : start + 500]
+                marks = ",".join("?" * len(chunk))
+                sql = (
+                    f'SELECT {", ".join(select)} FROM "{self._table}"'
+                    f' WHERE msg_id IN ({marks})'
+                )
+                for row in conn.execute(sql, chunk).fetchall():
+                    message = self._to_message(row)
+                    out[str(message.msg_id)] = message
+        return out
+
+    def seq_column(self) -> str | None:
+        """源表里有没有"群内消息序号"这一列（没有就返回 None）。
+
+        这一列决定了「回复 → 被回复的那条」能不能**确定性地**解析出来。
+        nt_msg_db_util 的字段文档说回复里的 `47402` 与群内序号匹配、而
+        `47422` 与主表 `40001` 不匹配 —— 也就是说**没有这一列就拿不到被引用
+        消息的 msg_id**。当前 3.export.py 的 `group_messages` 里没有它，
+        所以这里如实返回 None，由上层把"识别不了补充关系"明确报出来。
+        """
+        if not self._columns:
+            with closing(self._connect()) as conn:
+                self._columns = _column_names(conn, self._table)
+        return _first_present_key(self._columns, SEQ_COLUMN_CANDIDATES)
+
+    def resolve_seq(self, group_id: str, seq_value: str) -> str | None:
+        """把"群内序号"解析成那条消息的 msg_id。解析不了返回 None（**不猜**）。"""
+        column = self.seq_column()
+        if not column:
+            return None
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                f'SELECT msg_id FROM "{self._table}" WHERE group_id=? AND "{column}"=? LIMIT 1',
+                (str(group_id), str(seq_value)),
+            ).fetchone()
+        return str(row["msg_id"]) if row else None
 
     def iter_since(
         self, since_ts: int, since_msg_id: str = "", *, limit: int, chunk: int = 500

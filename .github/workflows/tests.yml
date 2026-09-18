@@ -36,3 +36,6 @@ jobs:
 
       - name: 源库读取器
         run: python -m tests.check_source_db
+
+      - name: 镜像库状态机（增量与"内容变了"的判据）
+        run: python -m tests.check_mirror

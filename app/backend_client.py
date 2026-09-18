@@ -288,36 +288,8 @@ class BackendClient:
         return body if isinstance(body, dict) else {}
 
     # ------------------------------------------------------------------
-    # 游标（存后端，按用户隔离）
+    # 健康
     # ------------------------------------------------------------------
-
-    async def get_cursor(self, key: str) -> dict | None:
-        """读游标。404 = 还没有（第一次运行），不是错误。"""
-        try:
-            body = await self._json(
-                "GET",
-                f"/api/state/{self.settings.client_cursor_namespace}/{key}",
-                purpose="cursor.get",
-                retries=0,
-            )
-        except BackendError as exc:
-            if exc.status_code == 404:
-                return None
-            raise
-        if isinstance(body, dict):
-            value = body.get("value")
-            return value if isinstance(value, dict) else None
-        return None
-
-    async def put_cursor(self, key: str, value: dict) -> dict:
-        resp = await self._write(
-            "PUT",
-            f"/api/state/{self.settings.client_cursor_namespace}/{key}",
-            json={"value": value},
-            purpose="cursor.put",
-        )
-        body = resp.json()
-        return body if isinstance(body, dict) else {}
 
     async def health(self) -> dict:
         """GET /api/health —— **永远不抛异常**。"""

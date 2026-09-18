@@ -1,4 +1,4 @@
-"""端到端：源库 → 客户端 → **真后端**。
+"""端到端：源库 → 客户端（镜像 + 补充）→ **真后端**。
 
 需要一个**正在运行的后端**：
 
@@ -10,16 +10,14 @@
 
 ## 这个文件要守住的东西
 
-1. **只用 UserToken 就能完整入库**。脚本注册一个真用户、拿他的 UserToken，
-   全程只用那个令牌。所以只要客户端偷偷调了一个服务令牌专属的接口，
-   这里就会以 403 失败 —— 权限边界不是靠 review 守的，是靠跑出来的。
-2. **订阅就是过滤条件**：订了的来源才入库，没订的连 raw 都不写、
-   更不会去抽取（不为没人要的消息花模型的钱）。
-3. **三层防重**：游标 → 已有通知集合 → 后端幂等。第二层是"游标丢了不心疼"
-   的关键，所以专门测它。
-4. **游标真的在推进**，而且下一轮不会重复处理。
-5. **不静默**：没有证据不建条、拿不到附件要留痕、写共享层被拒要能看出是
-   "你还没订阅"而不是"后端坏了"。
+1. **只用 UserToken 就能完整入库。** 脚本注册一个真用户、拿他的 UserToken，全程
+   只用那个令牌 —— 客户端只要偷偷调了一个服务令牌专属的接口，这里就会 403。
+2. **镜像就是增量状态**：处理过的不再重看、订阅外的记终态、内容变了要重新处理。
+3. **补充要改任务，不是新建任务**：新消息引用了一条已读消息时，更新的是
+   **被引用那条**（靠后端的 `(user_id, raw_message_id)` 幂等），通知总数不变。
+4. **认不出引用关系时不许猜**：如实按独立新消息处理，并把原因打出来
+   （源表没有群内序号列时就是这种情况）。
+5. **dry-run 一个状态都不写** —— 否则"先试跑一下"会让整个客户端再也不入库。
 """
 
 from __future__ import annotations
@@ -30,13 +28,15 @@ import os
 import shutil
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import httpx
 
 from app.backend_client import BackendClient
 from app.config import Settings
-from app.run import load_subscriptions, run_cycle, verify_identity
+from app.mirror import STATE_DONE, STATE_SKIPPED, Mirror
+from app.run import run_cycle, verify_identity
 from app.source.attachments import AttachmentResolver
 from app.source.ntmsg import SourceDatabase
 
@@ -44,7 +44,7 @@ BASE = os.environ.get("CLIENT_BASE", "http://127.0.0.1:8005").rstrip("/")
 API = BASE + "/api"
 SERVICE = os.environ.get("CLIENT_SERVICE_TOKEN", "service-token")
 
-RUN = os.environ.get("CLIENT_RUN") or str(int(__import__("time").time() * 1000))
+RUN = os.environ.get("CLIENT_RUN") or str(int(time.time() * 1000))
 QQ = str(500000000 + int(RUN[-7:]) % 40000000)
 _SUF = RUN[-7:]
 GROUP = "91" + _SUF
@@ -54,14 +54,9 @@ GROUP2 = "93" + _SUF
 SCRATCH = Path(__file__).resolve().parent.parent / ".tmp-test"
 H = {"Authorization": f"Bearer {SERVICE}"}
 
-# 源库的时间戳基准：**就在不久之前**，不是写死的绝对时间。
-#
-# 为什么：客户端默认只回看 CLIENT_INITIAL_LOOKBACK_HOURS（72 小时）。用一个
-# 固定的过去时间当基准，等这个测试过一阵子再跑（或者换台时钟不同的机器），
-# 所有消息都会落在回看窗口之外 —— 于是"扫了 0 条"，而失败原因和被测逻辑
-# 毫无关系。往前放 20 小时是刻意的：后面要造一条 16 小时后的消息来测缺口，
-# 那样它仍然落在过去、不会出现"未来时间的消息"这种怪东西。
-BASE_TS = int(__import__("time").time()) - 20 * 3600
+# 源库时间戳基准：**就在不久之前**，不是写死的绝对时间（否则回看窗口一过，
+# 整个测试会以"扫了 0 条"失败，而原因和被测逻辑毫无关系）。
+BASE_TS = int(time.time()) - 20 * 3600
 
 fails: list[str] = []
 total = 0
@@ -85,6 +80,9 @@ def check_true(name: str, cond: bool, detail: str = "") -> None:
 # 造源库
 # ---------------------------------------------------------------------------
 
+# `with_seq=True` 时额外带一列群内序号 —— nt_msg_db_util 的字段文档说回复里的
+# `47402` 与群内序号匹配，所以有这一列时"这条在回复哪一条"才能确定性解析出来。
+# 当前 3.export.py 的 group_messages **没有**这一列，所以两种都要能测。
 SOURCE_SCHEMA = """
 CREATE TABLE group_messages (
   msg_id TEXT PRIMARY KEY, timestamp INTEGER, direction INTEGER,
@@ -94,32 +92,46 @@ CREATE TABLE group_messages (
 );
 """
 
+SOURCE_SCHEMA_SEQ = """
+CREATE TABLE group_messages (
+  msg_id TEXT PRIMARY KEY, timestamp INTEGER, direction INTEGER,
+  sender_uid TEXT, sender_qq TEXT, group_id TEXT, group_qq TEXT,
+  msg_type INTEGER, subtype INTEGER, content_type INTEGER,
+  text TEXT, parse_status TEXT, content TEXT, "40003" INTEGER
+);
+"""
 
-def make_source_db(path: Path, rows: list[dict]) -> None:
+
+def make_source_db(path: Path, rows: list[dict], *, with_seq: bool = False) -> None:
     if path.exists():
         path.unlink()
     conn = sqlite3.connect(path)
     try:
-        conn.executescript(SOURCE_SCHEMA)
+        conn.executescript(SOURCE_SCHEMA_SEQ if with_seq else SOURCE_SCHEMA)
         for row in rows:
-            conn.execute(
-                "INSERT INTO group_messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    row["msg_id"],
-                    row["ts"],
-                    0,
-                    "u_x",
-                    row.get("sender", SENDER),
-                    row.get("group", GROUP),
-                    int(row.get("group", GROUP)),
-                    2,
-                    0,
-                    1,
-                    row.get("text", ""),
-                    row.get("status", "typed"),
-                    json.dumps(row["content"], ensure_ascii=False) if row.get("content") else None,
-                ),
+            content = row.get("content")
+            values = (
+                row["msg_id"],
+                row["ts"],
+                0,
+                "u_x",
+                row.get("sender", SENDER),
+                row.get("group", GROUP),
+                int(row.get("group", GROUP)),
+                2,
+                0,
+                1,
+                row.get("text", ""),
+                row.get("status", "typed"),
+                json.dumps(content, ensure_ascii=False) if content else None,
             )
+            if with_seq:
+                conn.execute(
+                    "INSERT INTO group_messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (*values, row.get("seq")),
+                )
+            else:
+                conn.execute("INSERT INTO group_messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
         conn.commit()
     finally:
         conn.close()
@@ -129,8 +141,32 @@ def text_of(text: str) -> dict:
     return {"type": "text", "text": text}
 
 
+def reply_of(text: str, target_seq: int) -> dict:
+    """一条「回复某条消息」的内容。
+
+    `47402` 装被回复消息的群内序号（按 nt_msg_db_util 的群字段文档），
+    `47413` 是引用摘要。放成 mixed 段，和真实导出库一样。
+    """
+    return {
+        "type": "mixed",
+        "segments": [
+            {"type": "reply", "47402": target_seq, "47413": "（引用）"},
+            {"type": "text", "text": text},
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 后端交互
+# ---------------------------------------------------------------------------
+
+
+def sync(token: str, path: str, method: str = "GET", **kwargs) -> httpx.Response:
+    with httpx.Client(base_url=BASE, timeout=20, headers={"Authorization": f"Bearer {token}"}) as c:
+        return c.request(method, path, **kwargs)
+
+
 def register_user() -> tuple[str, str]:
-    """注册一个真用户，返回 (user_id, UserToken)。"""
     c = httpx.Client(timeout=20)
     try:
         code = c.post(f"{API}/verify/request", json={"qq": QQ}, headers=H).json()["code"]
@@ -145,6 +181,10 @@ def register_user() -> tuple[str, str]:
         c.close()
 
 
+def notifications(token: str) -> list[dict]:
+    return sync(token, "/api/notifications").json()["notifications"]
+
+
 def make_settings(token: str, db_path: Path, **overrides) -> Settings:
     base = dict(
         backend_base_url=BASE,
@@ -152,6 +192,7 @@ def make_settings(token: str, db_path: Path, **overrides) -> Settings:
         backend_timeout=15.0,
         backend_max_retries=1,
         client_db_path=str(db_path),
+        client_mirror_path=str(SCRATCH / f"mirror-{RUN}.db"),
         client_extractor="rule",          # 核心链路不联网、不花钱
         client_initial_lookback_hours=72,
         client_batch_size=100,
@@ -159,33 +200,23 @@ def make_settings(token: str, db_path: Path, **overrides) -> Settings:
         client_poll_seconds=1,
         client_attachment_root="",
         client_missing_attachment="url",
-        client_cursor_key=f"e2e-{RUN}",
+        client_recheck_overlap_hours=2.0,
         client_gap_alert_hours=2.0,
+        client_amendment_enabled=True,
+        client_amendment_max_age_hours=72.0,
         digest_tz="Asia/Shanghai",
     )
     base.update(overrides)
     settings = Settings(**base)
-
-    # ⚠️ `Settings` 是 `extra="ignore"` 的：关键字名写错的项会被**静默丢掉**，
-    # 于是测试拿着默认值往下跑 —— 轻则失败原因和被测逻辑毫无关系，重则还能"通过"。
-    # 所以这里逐个核对关键项确实生效了。
-    # （对用户宽容、对测试严格：用户 .env 里留着淘汰的键不该让程序起不来。）
-    for name in ("client_db_path", "client_token", "client_extractor", "client_cursor_key"):
-        assert getattr(settings, name) == base[name], (
-            f"make_settings 的 {name} 没生效（关键字名写错了？extra=ignore 会静默丢掉）"
-        )
+    # Settings 是 extra="ignore"：关键字写错会被静默丢掉，测试就会拿着默认值跑
+    for name in ("client_db_path", "client_token", "client_extractor", "client_mirror_path"):
+        assert getattr(settings, name) == base[name], f"make_settings 的 {name} 没生效"
     for name, value in overrides.items():
         assert getattr(settings, name, None) == value, f"覆盖项 {name} 没生效"
     return settings
 
 
-def sync(token: str, path: str, method: str = "GET", **kwargs) -> httpx.Response:
-    """直接用某个令牌问后端（核对客户端写进去的东西）。"""
-    with httpx.Client(base_url=BASE, timeout=20, headers={"Authorization": f"Bearer {token}"}) as c:
-        return c.request(method, path, **kwargs)
-
-
-async def run_all() -> int:
+async def run_all() -> int:  # noqa: C901
     if SCRATCH.exists():
         shutil.rmtree(SCRATCH, ignore_errors=True)
     SCRATCH.mkdir(parents=True, exist_ok=True)
@@ -194,238 +225,312 @@ async def run_all() -> int:
     print(f"→ {BASE}\n    用户 {QQ} = {uid}\n")
 
     db_path = SCRATCH / f"e2e-{RUN}.db"
-    raw_ids: dict[str, str] = {}
+    mirror_path = SCRATCH / f"mirror-{RUN}.db"
 
-    # ------------------------------------------------------------------
-    print("--- 1. 身份自检：UserToken 就够了 ---")
-    settings = make_settings(token, db_path)
+    settings = make_settings(token, db_path, client_mirror_path=str(mirror_path))
     backend = BackendClient(settings)
+    mirror = Mirror(mirror_path)
     try:
+        # ----------------------------------------------------------------
+        print("--- 1. 身份自检：UserToken 就够了 ---")
         who = await verify_identity(backend, settings)
         check("scope 是 user（不是 service）", who.get("scope"), "user")
         check("拿到的是自己", (who.get("user") or {}).get("qq"), QQ)
 
-        # ------------------------------------------------------------------
-        print("\n--- 2. 还没订阅 → 本轮什么都不做，而且**游标也不动** ---")
+        # ----------------------------------------------------------------
+        print("\n--- 2. 还没订阅 → 本轮什么都不做，而且镜像也不动 ---")
         make_source_db(db_path, [
             {"msg_id": "1", "ts": BASE_TS, "text": "大家下周三前交军训心得", "content": text_of("大家下周三前交军训心得")},
         ])
-        report = await run_cycle(backend, settings, db=SourceDatabase(db_path))
-        check("一条都没扫（扫了也是白扫，而且会烧掉回看窗口）", report.scanned, 0)
-        check("没有建任何通知", report.outcomes.get("extracted"), None)
+        report = await run_cycle(backend, settings, db=SourceDatabase(db_path), mirror=mirror)
+        check("一条都没扫（扫了也是白扫，还会烧掉回看窗口）", report.scanned, 0)
         check_true("报错说清了是订阅的问题", any("订阅" in e for e in report.errors), str(report.errors[:1]))
-        check("后端里确实一条通知都没有", len(sync(token, "/api/notifications").json()["notifications"]), 0)
-        # 这一条是关键：先启动客户端、再去订阅是很自然的顺序。如果这里把游标
-        # 推到底，那 72 小时的存量就被这一次空跑烧掉了，用户订完之后会发现
-        # 什么都没补上、而且毫无线索。
-        check(
-            "游标没有被推进（保住回看窗口，订完之后还能补存量）",
-            sync(token, f"/api/state/{settings.client_cursor_namespace}/{settings.cursor_name}").status_code,
-            404,
-        )
+        check("镜像里一条都没记（下一轮才能补上存量）", mirror.stats()["total"], 0)
+        check("后端里也没有通知", len(notifications(token)), 0)
 
-        # ------------------------------------------------------------------
-        print("\n--- 3. 订上之后：存量直接补上 ---")
-        r = sync(token, "/api/subscriptions", "POST", json={"group_id": GROUP, "sender_id": SENDER})
-        check("用**用户令牌**订阅 → 200", r.status_code, 200)
-
-        report = await run_cycle(backend, settings, db=SourceDatabase(db_path))
-        check("订了之后 → extracted", report.outcomes.get("extracted"), 1)
-        notifications = sync(token, "/api/notifications").json()["notifications"]
-        check("后端里有 1 条通知", len(notifications), 1)
-        notif = notifications[0]
-        check("标题抽对了", notif.get("title"), "大家下周三前交军训心得")
-        check_true("截止时间解析出来了", notif.get("due_at") is not None, str(notif.get("due_at")))
-        check("地点为空（原文没写地点，不许编）", notif.get("location"), None)
-        check("抽取器是 rule", notif.get("extractor"), "rule")
-        check_true("证据非空", bool(notif.get("evidence")), str(notif.get("evidence")))
-        raw_ids["1"] = str(notif.get("raw_message_id"))
-
-        # ------------------------------------------------------------------
-        print("\n--- 4. 游标推进了：再跑一轮什么都不做 ---")
-        cursor = sync(token, f"/api/state/{settings.client_cursor_namespace}/{settings.cursor_name}").json()["value"]
-        check("游标停在最后一条的位置", (cursor.get("ts"), cursor.get("msg_id")), (BASE_TS, "1"))
-        report = await run_cycle(backend, settings, db=SourceDatabase(db_path))
-        check("第二轮没扫到新消息", report.scanned, 0)
-        check("通知还是 1 条（没有重复）", len(sync(token, "/api/notifications").json()["notifications"]), 1)
-
-        # ------------------------------------------------------------------
-        print("\n--- 5. 增量：新消息进来只处理新的 ---")
-        make_source_db(db_path, [
-            {"msg_id": "1", "ts": BASE_TS, "text": "大家下周三前交军训心得", "content": text_of("大家下周三前交军训心得")},
-            {"msg_id": "2", "ts": BASE_TS + 60, "text": "收到", "content": text_of("收到")},
-            {"msg_id": "3", "ts": BASE_TS + 120, "text": "本周五19:00在教三201开班会", "content": text_of("本周五19:00在教三201开班会")},
-        ])
-        report = await run_cycle(backend, settings, db=SourceDatabase(db_path))
-        check("只扫了 2 条新的", report.scanned, 2)
-        check("闲聊判成 noise", report.outcomes.get("noise"), 1)
-        check("开会那条建成了", report.outcomes.get("extracted"), 1)
-        after = sync(token, "/api/notifications").json()["notifications"]
-        check("通知变成 2 条", len(after), 2)
-        titles = sorted(n.get("title") or "" for n in after)
-        check_true("两条标题都在", any("开班会" in t for t in titles), str(titles))
-
-        # ------------------------------------------------------------------
-        print("\n--- 6. 游标丢了也不重复抽（这是最省钱的一层）---")
-        # 把游标删掉，模拟"换了机器 / bot_state 被清"：
-        sync(token, f"/api/state/{settings.client_cursor_namespace}/{settings.cursor_name}", "DELETE")
-        report = await run_cycle(backend, settings, db=SourceDatabase(db_path))
-        check("回扫了全部 3 条", report.scanned, 3)
-        check("其中 2 条被识别为「已经建过通知」而跳过", report.already_done, 2)
-        check_true("没有重复建条", len(sync(token, "/api/notifications").json()["notifications"]) == 2, str(report.outcomes))
-        check("游标又被写回去了", sync(
-            token, f"/api/state/{settings.client_cursor_namespace}/{settings.cursor_name}"
+        # ----------------------------------------------------------------
+        print("\n--- 3. 订上之后：存量补上，镜像记成 done ---")
+        check("用**用户令牌**订阅 → 200", sync(
+            token, "/api/subscriptions", "POST", json={"group_id": GROUP, "sender_id": SENDER}
         ).status_code, 200)
 
-        # ------------------------------------------------------------------
-        print("\n--- 7. 订阅之外的来源：连 raw 都不写 ---")
+        report = await run_cycle(backend, settings, db=SourceDatabase(db_path), mirror=mirror)
+        check("订了之后 → extracted", report.outcomes.get("extracted"), 1)
+        check("后端里有 1 条通知", len(notifications(token)), 1)
+        notif = notifications(token)[0]
+        check("标题抽对了", notif.get("title"), "大家下周三前交军训心得")
+        check_true("截止时间解析出来了", notif.get("due_at") is not None, str(notif.get("due_at")))
+        row = mirror.get("1")
+        check("镜像里记成 done", row.state, STATE_DONE)
+        check_true("而且记下了后端的 raw_id（补充要落回它）", bool(row.raw_id), str(row.raw_id))
+        first_raw_id = row.raw_id
+        first_notif_id = notif["id"]
+
+        # ----------------------------------------------------------------
+        print("\n--- 4. 再跑一轮：内容没变 → 一条都不重抽 ---")
+        report = await run_cycle(backend, settings, db=SourceDatabase(db_path), mirror=mirror)
+        check("扫到的都判成 unchanged", report.unchanged, 1)
+        check("没有处理任何一条", report.processed, 0)
+        check("通知还是 1 条", len(notifications(token)), 1)
+
+        # ----------------------------------------------------------------
+        print("\n--- 5. 增量：新消息只处理新的 ---")
         make_source_db(db_path, [
             {"msg_id": "1", "ts": BASE_TS, "text": "大家下周三前交军训心得", "content": text_of("大家下周三前交军训心得")},
             {"msg_id": "2", "ts": BASE_TS + 60, "text": "收到", "content": text_of("收到")},
             {"msg_id": "3", "ts": BASE_TS + 120, "text": "本周五19:00在教三201开班会", "content": text_of("本周五19:00在教三201开班会")},
-            # 没订阅的群，以及同群里没订阅的发送者
-            {"msg_id": "4", "ts": BASE_TS + 180, "group": GROUP2, "text": "下周一交实验报告", "content": text_of("下周一交实验报告")},
-            {"msg_id": "5", "ts": BASE_TS + 240, "sender": "19999", "text": "明天上午交材料", "content": text_of("明天上午交材料")},
         ])
-        sync(token, f"/api/state/{settings.client_cursor_namespace}/{settings.cursor_name}", "DELETE")
-        report = await run_cycle(backend, settings, db=SourceDatabase(db_path))
-        check("5 条里跳过了 2 条订阅外的", report.skipped_unsubscribed, 2)
-        check("通知还是 2 条（订阅外的没被建）", len(sync(token, "/api/notifications").json()["notifications"]), 2)
+        report = await run_cycle(backend, settings, db=SourceDatabase(db_path), mirror=mirror)
+        check("只处理了 2 条新的（第 1 条没动）", report.processed, 2)
+        check("闲聊判成 noise", report.outcomes.get("noise"), 1)
+        check("开会那条建成了", report.outcomes.get("extracted"), 1)
+        check("通知变成 2 条", len(notifications(token)), 2)
+        check("收到那条在镜像里是 skipped（终态，不再重看）", mirror.get("2").state, STATE_SKIPPED)
 
-        # ------------------------------------------------------------------
-        print("\n--- 8. 附件：拿不到字节要留痕，不静默 ---")
+        # ----------------------------------------------------------------
+        print("\n--- 6. 镜像被删了也不重复抽（后端通知集合兜底）---")
+        mirror_path.unlink()
+        mirror = Mirror(mirror_path)
+        check("新镜像里什么都没有", mirror.stats()["total"], 0)
+        report = await run_cycle(backend, settings, db=SourceDatabase(db_path), mirror=mirror)
+        check("通知还是 2 条（没有重复建）", len(notifications(token)), 2)
+        check_true(
+            "而且没有重新花模型的钱（走的是「已经建过通知」那条路）",
+            report.unchanged >= 2,
+            f"unchanged={report.unchanged} outcomes={report.outcomes}",
+        )
+        check("镜像被重新补起来了（下次就靠它了）", mirror.get("1").state, STATE_DONE)
+
+        # ----------------------------------------------------------------
+        print("\n--- 7. 订阅之外的来源：镜像记 skipped，不当成没处理 ---")
         make_source_db(db_path, [
-            {
-                "msg_id": "10",
-                "ts": BASE_TS + 300,
-                "text": "下周三前把回执表交到学工办",
-                "content": {
-                    "type": "mixed",
-                    "segments": [
-                        {"type": "text", "text": "下周三前把回执表交到学工办"},
-                        {"type": "image", "filename": "回执.png", "cdn_url": "https://cdn.example.dead/x.png",
-                         "md5_hex": "ffffffffffffffffffffffffffffffff", "filesize": 1024},
-                    ],
-                },
-            },
+            {"msg_id": "10", "ts": BASE_TS + 200, "group": GROUP2, "text": "下周一交实验报告", "content": text_of("下周一交实验报告")},
+            {"msg_id": "11", "ts": BASE_TS + 240, "sender": "19999", "text": "明天上午交材料", "content": text_of("明天上午交材料")},
         ])
-        sync(token, f"/api/state/{settings.client_cursor_namespace}/{settings.cursor_name}", "DELETE")
-        report = await run_cycle(backend, settings, db=SourceDatabase(db_path))
-        check("带附件那条建成了", report.outcomes.get("extracted"), 1)
-        # 没配附件根目录 → 只能留远程地址，而且要标出这是降级的
-        found = [
-            n for n in sync(token, "/api/notifications").json()["notifications"]
-            if "回执" in (n.get("title") or "")
-        ]
-        check_true("找到那条通知", bool(found), "没有标题含「回执」的通知")
-        if found:
-            atts = found[0].get("attachments") or []
-            check("记了 1 个附件", len(atts), 1)
-            check_true("附件标了 degraded（拿不到字节这件事没被吞）", atts[0].get("degraded"), str(atts[:1]))
-            check_true("附件里带原因", bool(atts[0].get("degraded_reason")), str(atts[:1]))
-
-        # 配上附件目录、并把字节按 md5 放进去之后，应该能真的上传
-        att_root = SCRATCH / "attachments"
-        att_root.mkdir(exist_ok=True)
-        (att_root / "ffffffffffffffffffffffffffffffff").write_bytes(b"\x89PNGfake")
-        settings2 = make_settings(token, db_path, client_attachment_root=str(att_root))
+        mirror2_path = SCRATCH / f"mirror2-{RUN}.db"
+        mirror2 = Mirror(mirror2_path)
+        settings2 = make_settings(token, db_path, client_mirror_path=str(mirror2_path))
         backend2 = BackendClient(settings2)
         try:
-            make_source_db(db_path, [
-                {
-                    "msg_id": "11",
-                    "ts": BASE_TS + 360,
-                    "text": "下周三前把回执表交到学工办（第二版）",
-                    "content": {
-                        "type": "mixed",
-                        "segments": [
-                            {"type": "text", "text": "下周三前把回执表交到学工办（第二版）"},
-                            {"type": "image", "filename": "回执2.png",
-                             "cdn_url": "https://cdn.example.dead/y.png",
-                             "md5_hex": "ffffffffffffffffffffffffffffffff", "filesize": 8},
-                        ],
-                    },
-                },
-            ])
-            sync(token, f"/api/state/{settings2.client_cursor_namespace}/{settings2.cursor_name}", "DELETE")
-            report = await run_cycle(
-                backend2, settings2, db=SourceDatabase(db_path), resolver=AttachmentResolver(att_root)
-            )
-            check("第二条带附件的也建成了", report.outcomes.get("extracted"), 1)
-            found2 = [
-                n for n in sync(token, "/api/notifications").json()["notifications"]
-                if "第二版" in (n.get("title") or "")
-            ]
-            if found2:
-                atts2 = found2[0].get("attachments") or []
-                check("附件记了 1 个", len(atts2), 1)
-                check_true(
-                    "这次是真的上传了（有 id、不是只留地址）",
-                    bool(atts2 and atts2[0].get("id")),
-                    str(atts2[:1]),
-                )
-                check_true(
-                    "而且 url 指向后端的附件接口",
-                    "/api/attachments/" in str(atts2[0].get("url") if atts2 else ""),
-                    str(atts2[:1]),
-                )
+            report = await run_cycle(backend2, settings2, db=SourceDatabase(db_path), mirror=mirror2)
+            check("两条都跳过了", report.skipped_unsubscribed, 2)
+            check("订阅外的也记进了镜像", mirror2.get("10").state, STATE_SKIPPED)
+            check("同一个群里没订的发送者也跳过", mirror2.get("11").state, STATE_SKIPPED)
+            check("通知数没变", len(notifications(token)), 2)
         finally:
             await backend2.close()
 
-        # ------------------------------------------------------------------
-        print("\n--- 9. 统计按用户、写进去了 ---")
+        # ----------------------------------------------------------------
+        print("\n--- 8. 内容被改了 → 重新处理，**更新原来那条任务** ---")
+        mirror = Mirror(mirror_path)
+        before_count = len(notifications(token))
+        make_source_db(db_path, [
+            # 同一条 msg_id（1），正文多了"改到本周五"
+            {"msg_id": "1", "ts": BASE_TS, "text": "大家下周三前交军训心得，改到本周五", "content": text_of("大家下周三前交军训心得，改到本周五")},
+            {"msg_id": "2", "ts": BASE_TS + 60, "text": "收到", "content": text_of("收到")},
+            {"msg_id": "3", "ts": BASE_TS + 120, "text": "本周五19:00在教三201开班会", "content": text_of("本周五19:00在教三201开班会")},
+        ])
+        report = await run_cycle(backend, settings, db=SourceDatabase(db_path), mirror=mirror)
+        check("识别成内容变了并重新处理", report.processed, 1)
+        after = notifications(token)
+        check("**通知条数没变**（是更新，不是新建）", len(after), before_count)
+        same = [n for n in after if n["id"] == first_notif_id]
+        check_true("还是原来那一条", bool(same), f"找的是 {first_notif_id}")
+        if same:
+            blob = json.dumps(same[0], ensure_ascii=False)
+            check_true(
+                "正文里的改动进了这条任务（能看到新的说法）",
+                "周五" in blob,
+                json.dumps({k: same[0].get(k) for k in ("title", "summary", "evidence")}, ensure_ascii=False),
+            )
+            check("raw_message_id 还是原来那个（没有另起一条）", same[0].get("raw_message_id"), first_raw_id)
+        check("镜像里回到 done", mirror.get("1").state, STATE_DONE)
+
+        # ----------------------------------------------------------------
+        print("\n--- 9. 补充：新消息引用了已读消息 → 改那条任务，不新建 ---")
+        mirror3_path = SCRATCH / f"mirror3-{RUN}.db"
+        db_seq = SCRATCH / f"e2e-seq-{RUN}.db"
+        mirror3 = Mirror(mirror3_path)
+        settings3 = make_settings(token, db_seq, client_mirror_path=str(mirror3_path))
+        backend3 = BackendClient(settings3)
+        try:
+            # 先让镜像里有一条"已读且已建任务"的消息（msg_id=100，群内序号 500）
+            make_source_db(db_seq, [
+                {"msg_id": "100", "seq": 500, "ts": BASE_TS + 1000,
+                 "text": "下周三前把材料交到学工办", "content": text_of("下周三前把材料交到学工办")},
+            ], with_seq=True)
+            report = await run_cycle(backend3, settings3, db=SourceDatabase(db_seq), mirror=mirror3)
+            check("先建出原任务", report.outcomes.get("extracted"), 1)
+            original_raw = mirror3.get("100").raw_id
+            check_true("镜像里有它的 raw_id", bool(original_raw), str(original_raw))
+            base_count = len(notifications(token))
+            base_notif = [n for n in notifications(token) if n.get("raw_message_id") == original_raw]
+            check_true("后端里能找到这条任务", bool(base_notif), str(original_raw))
+
+            # 再来一条**回复**它的消息
+            make_source_db(db_seq, [
+                {"msg_id": "100", "seq": 500, "ts": BASE_TS + 1000,
+                 "text": "下周三前把材料交到学工办", "content": text_of("下周三前把材料交到学工办")},
+                {"msg_id": "101", "seq": 501, "ts": BASE_TS + 1200,
+                 "text": "补充：截止时间改到本周五，交到教三201",
+                 "content": reply_of("补充：截止时间改到本周五，交到教三201", 500)},
+            ], with_seq=True)
+            report = await run_cycle(backend3, settings3, db=SourceDatabase(db_seq), mirror=mirror3)
+            check("识别成补充并更新了任务", report.outcomes.get("amended"), 1)
+            check("amended 计数", report.amended, 1)
+            after = notifications(token)
+            check("**通知条数没变**（补充改的是原任务）", len(after), base_count)
+            merged = [n for n in after if n.get("raw_message_id") == original_raw]
+            check_true("原任务还在", bool(merged), str(original_raw))
+            if merged:
+                blob = json.dumps(merged[0], ensure_ascii=False)
+                check_true("补充的内容进了这条任务", "补充" in blob or "教三201" in blob, blob[:300])
+                check_true(
+                    "截止时间被补充改掉了（改到本周五）",
+                    "周五" in str(merged[0].get("due_text") or "") or merged[0].get("due_at") is not None,
+                    json.dumps({k: merged[0].get(k) for k in ("due_text", "due_at")}, ensure_ascii=False),
+                )
+            check("补充那条在镜像里记成 done", mirror3.get("101").state, STATE_DONE)
+            check("补充关系记下来了", mirror3.amendment_of("101"), "100")
+
+            # ------------------------------------------------------------
+            print("\n--- 9b. 源表没有群内序号列 → 认不出引用，按独立新消息处理（不猜）---")
+            mirror4_path = SCRATCH / f"mirror4-{RUN}.db"
+            db_noseq = SCRATCH / f"e2e-noseq-{RUN}.db"
+            mirror4 = Mirror(mirror4_path)
+            settings4 = make_settings(token, db_noseq, client_mirror_path=str(mirror4_path))
+            backend4 = BackendClient(settings4)
+            try:
+                make_source_db(db_noseq, [
+                    {"msg_id": "200", "ts": BASE_TS + 2000, "text": "下周三前交实验报告",
+                     "content": text_of("下周三前交实验报告")},
+                ])
+                await run_cycle(backend4, settings4, db=SourceDatabase(db_noseq), mirror=mirror4)
+                count_before = len(notifications(token))
+                make_source_db(db_noseq, [
+                    {"msg_id": "200", "ts": BASE_TS + 2000, "text": "下周三前交实验报告",
+                     "content": text_of("下周三前交实验报告")},
+                    {"msg_id": "201", "ts": BASE_TS + 2100, "text": "补充：改到周五",
+                     "content": reply_of("补充：改到周五", 900)},
+                ])
+                src = SourceDatabase(db_noseq)
+                check("确认这个库没有群内序号列", src.seq_column(), None)
+                check("确认引用值被读出来了（只是解析不了）", src.fetch_since(0, "", limit=5)[1].quote_ref, "900")
+                report = await run_cycle(backend4, settings4, db=src, mirror=mirror4)
+                check_true(
+                    "认不出引用 → 按独立新消息处理（不猜）",
+                    report.outcomes.get("amended") is None,
+                    str(report.outcomes),
+                )
+                check("于是多了一条通知（这是诚实的降级）", len(notifications(token)), count_before + 1)
+            finally:
+                await backend4.close()
+        finally:
+            await backend3.close()
+
+        # ----------------------------------------------------------------
+        print("\n--- 10. dry-run：一个写请求都不发，**镜像也一个状态都不写** ---")
+        mirror5_path = SCRATCH / f"mirror5-{RUN}.db"
+        db_dry = SCRATCH / f"e2e-dry-{RUN}.db"
+        mirror5 = Mirror(mirror5_path)
+        settings5 = make_settings(
+            token, db_dry, client_mirror_path=str(mirror5_path), client_dry_run=True
+        )
+        backend5 = BackendClient(settings5)
+        try:
+            make_source_db(db_dry, [
+                {"msg_id": "300", "ts": BASE_TS + 3000, "text": "下周三前交材料", "content": text_of("下周三前交材料")},
+            ])
+            count_before = len(notifications(token))
+            report = await run_cycle(backend5, settings5, db=SourceDatabase(db_dry), mirror=mirror5)
+            check("dry-run 也看了消息", report.scanned, 1)
+            check("通知数没变", len(notifications(token)), count_before)
+            check("镜像里一条都没记（否则真跑时会全被跳过）", mirror5.stats()["total"], 0)
+
+            # 紧接着真跑一次，必须**照常入库** —— 上面那条的回归测试
+            settings6 = make_settings(token, db_dry, client_mirror_path=str(mirror5_path))
+            backend6 = BackendClient(settings6)
+            try:
+                report = await run_cycle(
+                    backend6, settings6, db=SourceDatabase(db_dry), mirror=mirror5
+                )
+                check("试跑之后再真跑，照常入库", report.outcomes.get("extracted"), 1)
+                check("通知数 +1", len(notifications(token)), count_before + 1)
+                check("镜像记成 done", mirror5.get("300").state, STATE_DONE)
+            finally:
+                await backend6.close()
+        finally:
+            await backend5.close()
+
+        # ----------------------------------------------------------------
+        print("\n--- 11. 附件：配了附件目录就能真的上传 ---")
+        att_root = SCRATCH / "attachments"
+        att_root.mkdir(exist_ok=True)
+        (att_root / "ffffffffffffffffffffffffffffffff").write_bytes(b"\x89PNGfake")
+        mirror6_path = SCRATCH / f"mirror6-{RUN}.db"
+        db_att = SCRATCH / f"e2e-att-{RUN}.db"
+        mirror6 = Mirror(mirror6_path)
+        settings7 = make_settings(
+            token, db_att, client_mirror_path=str(mirror6_path),
+            client_attachment_root=str(att_root),
+        )
+        backend7 = BackendClient(settings7)
+        try:
+            make_source_db(db_att, [{
+                "msg_id": "400", "ts": BASE_TS + 4000, "text": "下周三前把回执表交到学工办",
+                "content": {"type": "mixed", "segments": [
+                    {"type": "text", "text": "下周三前把回执表交到学工办"},
+                    {"type": "image", "filename": "回执.png", "cdn_url": "https://cdn.example.dead/x.png",
+                     "md5_hex": "ffffffffffffffffffffffffffffffff", "filesize": 8},
+                ]},
+            }])
+            report = await run_cycle(
+                backend7, settings7,
+                db=SourceDatabase(db_att),
+                resolver=AttachmentResolver(att_root),
+                mirror=mirror6,
+            )
+            check("带附件那条建成了", report.outcomes.get("extracted"), 1)
+            found = [n for n in notifications(token) if "回执" in (n.get("title") or "")]
+            check_true("找到那条通知", bool(found), "没有标题含「回执」的通知")
+            if found:
+                atts = found[0].get("attachments") or []
+                check("记了 1 个附件", len(atts), 1)
+                check_true("是**真的上传过**的（有 id）", bool(atts and atts[0].get("id")), str(atts[:1]))
+                check_true(
+                    "url 指向后端的附件接口",
+                    "/api/attachments/" in str(atts[0].get("url") if atts else ""),
+                    str(atts[:1]),
+                )
+        finally:
+            await backend7.close()
+
+        # ----------------------------------------------------------------
+        print("\n--- 12. 统计按用户写进去了 ---")
         stats = sync(token, "/api/stats").json()
         check_true("统计里有 extracted", int(stats.get("extracted") or 0) > 0, str(stats))
         check_true("统计里有 ingested", int(stats.get("ingested") or 0) > 0, str(stats))
 
-        # ------------------------------------------------------------------
-        print("\n--- 10. 没有证据的抽出一律不建条（硬约束）---")
-        # rule 抽取器在只有关键词、没有时间时也会给 evidence，所以这里直接构造
-        # 一个"抽取结果没证据"的场景：用一条既没关键词也没时间的消息，
-        # 它应该被判成 noise（而不是建一条没有证据的条）。
-        make_source_db(db_path, [
-            {"msg_id": "20", "ts": BASE_TS + 420, "text": "哈哈哈哈", "content": text_of("哈哈哈哈")},
-        ])
-        sync(token, f"/api/state/{settings.client_cursor_namespace}/{settings.cursor_name}", "DELETE")
-        before = len(sync(token, "/api/notifications").json()["notifications"])
-        report = await run_cycle(backend, settings, db=SourceDatabase(db_path))
-        check("纯闲聊判成 noise", report.outcomes.get("noise"), 1)
-        check("通知数没变", len(sync(token, "/api/notifications").json()["notifications"]), before)
-
-        # ------------------------------------------------------------------
-        print("\n--- 11. 缺口检测：按用户扇出 ---")
-        sync(token, f"/api/state/{settings.client_cursor_namespace}/{settings.cursor_name}", "DELETE")
-        make_source_db(db_path, [
-            {"msg_id": "30", "ts": BASE_TS + 1000, "text": "下周三交材料", "content": text_of("下周三交材料")},
-            # 隔 16 小时再来一条 → 应该产生缺口告警
-            {"msg_id": "31", "ts": BASE_TS + 1000 + 16 * 3600, "text": "下周三交材料", "content": text_of("下周三交材料")},
-        ])
-        report = await run_cycle(backend, settings, db=SourceDatabase(db_path))
-        check("两条都处理了", report.outcomes.get("extracted"), 2)
-        alerts = sync(token, "/api/gap-alerts").json()["alerts"]
-        check_true("产生了缺口告警", len(alerts) >= 1, str(alerts[:1]))
-        if alerts:
-            check_true("告警写明了间隔", "16.0 小时" in str(alerts[0].get("reason")), str(alerts[0].get("reason")))
-
-        # ------------------------------------------------------------------
-        print("\n--- 12. dry-run：一个写请求都不发 ---")
-        settings_dry = make_settings(token, db_path, client_dry_run=True)
-        cursor_key = f"dry-{RUN}"
-        settings_dry = settings_dry.model_copy(update={"client_cursor_key": cursor_key})
-        backend3 = BackendClient(settings_dry)
+        # ----------------------------------------------------------------
+        print("\n--- 13. 缺口检测：群静默过久 → 按用户产生告警 ---")
+        mirror7_path = SCRATCH / f"mirror7-{RUN}.db"
+        db_gap = SCRATCH / f"e2e-gap-{RUN}.db"
+        mirror7 = Mirror(mirror7_path)
+        settings8 = make_settings(token, db_gap, client_mirror_path=str(mirror7_path))
+        backend8 = BackendClient(settings8)
         try:
-            sync(token, f"/api/state/{settings_dry.client_cursor_namespace}/{cursor_key}", "DELETE")
-            before = len(sync(token, "/api/notifications").json()["notifications"])
-            report = await run_cycle(backend3, settings_dry, db=SourceDatabase(db_path))
-            check_true("dry-run 也扫了消息", report.scanned > 0, str(report.scanned))
-            check("通知数没变", len(sync(token, "/api/notifications").json()["notifications"]), before)
-            check(
-                "dry-run 没有写游标（下次还会重扫，这是刻意的）",
-                sync(token, f"/api/state/{settings_dry.client_cursor_namespace}/{cursor_key}").status_code,
-                404,
-            )
+            make_source_db(db_gap, [
+                {"msg_id": "500", "ts": BASE_TS + 5000, "text": "下周三交材料", "content": text_of("下周三交材料")},
+                {"msg_id": "501", "ts": BASE_TS + 5000 + 16 * 3600, "text": "下周三交材料", "content": text_of("下周三交材料")},
+            ])
+            report = await run_cycle(backend8, settings8, db=SourceDatabase(db_gap), mirror=mirror7)
+            check("两条都处理了", report.outcomes.get("extracted"), 2)
+            alerts = sync(token, "/api/gap-alerts").json()["alerts"]
+            check_true("产生了缺口告警", len(alerts) >= 1, str(alerts[:1]))
+            if alerts:
+                check_true("告警写明了间隔", "16.0 小时" in str(alerts[0].get("reason")), str(alerts[0].get("reason")))
         finally:
-            await backend3.close()
+            await backend8.close()
     finally:
         await backend.close()
 
