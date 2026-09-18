@@ -125,18 +125,19 @@ schtasks /create /tn XcollectorClient /sc minute /mo 5 ^
 
 ### Docker
 
-镜像 `ghcr.io/xqy1y4ever/xcollector-client:latest`。compose 里用 profile 关着：
+镜像 `ghcr.io/xqy1y4ever/xcollector-client:latest`。它是 bot 那个栈里的第二条入库
+链路（`./start.sh client`），和 bot 二选一：
 
 ```bash
-cd xcollector-deploy
-# .env 里配：CLIENT_NT_MSG_HOST_DIR（放着 nt_msg.db 的目录）、CLIENT_NT_MSG_KEY、CLIENT_TOKEN
-docker compose --profile client run --rm client --prepare   # 先看解密报告
-docker compose --profile client up -d
+cd xcollector-deploy/bot
+# .env 里配：CLIENT_TOKEN、CLIENT_NT_MSG_HOST_DIR（放着 nt_msg.db 的目录）、CLIENT_NT_MSG_KEY
+./start.sh client
 ```
 
 那个目录是**读写**挂进去的（解密产物写在 `nt_msg.db` 旁边）。也可以只挂现成的
-`nt_msg_export.db`（B 方案，把 `CLIENT_DB_PATH` 设成 `/data/nt/nt_msg_export.db`）。
-见 [`xcollector-deploy`](https://github.com/Xqy1y4ever/xcollector-deploy) 的 README。
+`nt_msg_export.db`（B 方案：把文件放进同一个目录，并把 `CLIENT_DB_PATH` 设成
+`/data/nt/nt_msg_export.db`）。见
+[`xcollector-deploy`](https://github.com/Xqy1y4ever/xcollector-deploy) 的 README。
 
 ### 确认在跑
 
