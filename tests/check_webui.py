@@ -12,6 +12,9 @@ Web UI 是**唯一会写用户 `.env` 的东西**，所以它的错法都很脏�
    页面上留空提交 = 不改动（而不是"清空"）。
 3. **被别的网站调**：写接口要求 `Content-Type: application/json` + `X-XC-UI` 头，
    跨站请求发不出这种请求。这里专门验一条"不带头的 POST 必须 403"。
+4. **"标为未读"不许静默**（第 8 节）：它得真的把镜像改成 `reprocess`、界面上看得见
+   条数、正在跑的时候拒绝（一边跑一边标只标了一半）、而且**不**顺手花掉模型的钱
+   （`run` 必须显式给）。
 
 HTTP 层是真起一个服务（`ThreadingHTTPServer` 绑 127.0.0.1:0 拿随机端口），
 因为"接口能不能通"只有真发一次请求才算数。
@@ -36,8 +39,11 @@ from pathlib import Path
 
 import httpx
 
-from app.config import Settings
+from app.config import Settings, get_settings
+from app.mirror import STATE_DONE, STATE_REPROCESS, Mirror
+from app.source.ntmsg import SourceMessage
 from app.webui import envfile
+from app.webui import server as ui_server
 from app.webui.server import Handler
 from tests._hermetic import isolate_settings
 
@@ -229,6 +235,71 @@ def main() -> int:  # noqa: C901
             check("mode 写错 → 400", r.status_code, 400)
             r = c.post(f"{base}/api/stop", headers=ui_headers, json={})
             check("停止接口也能调（没在跑时说明白）", r.json()["message"], "现在没在跑")
+
+            print("\n--- 8. 标为未读：把镜像里的记录改回「未读」，下一轮重抽一遍 ---")
+            # 镜像路径也得指到临时目录：不指的话 `resolved_mirror_path` 给的是
+            # `<仓库>/mirror.db` —— 这个测试就会去动仓库里那个真文件。
+            envfile.write_env_values({"CLIENT_MIRROR_PATH": str(SCRATCH / "ui-mirror.db")})
+            get_settings.cache_clear()
+            store = Mirror(SCRATCH / "ui-mirror.db")
+            for i in ("1", "2"):
+                store.claim(SourceMessage(
+                    msg_id=i, timestamp=1000 + int(i), group_id="g1", sender_id="10001",
+                    sender_name=None, text="下周三前交材料",
+                ))
+                store.finish(i, state=STATE_DONE)
+            check("镜像里先有 2 条 done", store.stats()["by_state"].get("done"), 2)
+
+            r = c.post(f"{base}/api/mark-unread", json={})
+            check("不带 X-XC-UI 头 → 403（它是个写接口）", r.status_code, 403)
+            r = c.get(f"{base}/api/config")
+            check("被拒之后 keep-alive 仍然正常", r.status_code, 200)
+
+            r = c.post(f"{base}/api/mark-unread", headers=ui_headers, json={})
+            check("标为未读 → 200", r.status_code, 200)
+            body = r.json()
+            check("本次标了 2 条", body["marked"], 2)
+            check("标完之后共 2 条等着重抽", body["total"], 2)
+            check("默认**不**顺手跑一轮（跑是要花钱的，得显式要求）", body.get("run_started"), None)
+            check("镜像里变成 reprocess", store.get("1").state, STATE_REPROCESS)
+            check("状态接口里看得见这个数（不然用户以为没生效）",
+                  c.get(f"{base}/api/state").json()["mirror"]["reprocess"], 2)
+
+            r = c.post(f"{base}/api/mark-unread", headers=ui_headers, json={"msg_ids": []})
+            check("空数组 = 什么都不标（不是「全部」）", r.json()["marked"], 0)
+            r = c.post(f"{base}/api/mark-unread", headers=ui_headers, json={"msg_ids": "1"})
+            check("msg_ids 不是数组 → 400", r.status_code, 400)
+            r = c.post(f"{base}/api/mark-unread", headers=ui_headers, json={"msg_ids": ["1"]})
+            check("点名标一条 → 200", r.status_code, 200)
+            check("但它已经在队列里了，所以没有新标的", r.json()["marked"], 0)
+            check("总数还是 2", r.json()["total"], 2)
+
+            # 正在跑的时候必须拒绝：一边跑一边标，正在处理的那几条会被这一轮的
+            # 结果（done/skipped）盖掉 —— 用户以为标上了，其实只标了一半。
+            ui_server.RUNNER._set(mode="once")
+            try:
+                r = c.post(f"{base}/api/mark-unread", headers=ui_headers, json={})
+                check("正在跑 → 409", r.status_code, 409)
+                check_true("说清了为什么", "跑" in r.text, r.text[:140])
+            finally:
+                ui_server.RUNNER._set(mode="idle", stop_requested=False)
+            r = c.get(f"{base}/api/config")
+            check("被拒之后 keep-alive 还是好的", r.status_code, 200)
+
+            # 页面按钮走的就是这条路：标记 + 立刻跑一轮
+            r = c.post(f"{base}/api/mark-unread", headers=ui_headers, json={"run": True})
+            check("标记并跑一轮 → 200", r.status_code, 200)
+            check("说已开始跑", r.json().get("run_started"), True)
+            deadline = time.time() + 25
+            last = {}
+            while time.time() < deadline:
+                last = c.get(f"{base}/api/state").json()["run"]
+                if last.get("last_error") and not last.get("busy"):
+                    break
+                time.sleep(0.3)
+            check("跑完回到空闲", last.get("busy"), False)
+            check_true("那一轮留下了失败原因（这个测试没配源库）",
+                       "源库" in str(last.get("last_error")), str(last.get("last_error")))
     finally:
         httpd.shutdown()
         httpd.server_close()

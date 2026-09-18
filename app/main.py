@@ -1,15 +1,21 @@
 """入口：`python -m app.main`（或用 `.bat` / systemd timer / 计划任务）。
 
-## 四种跑法
+## 五种跑法
 
-    python -m app.main --ui       # 本机 Web UI：配置 / 跑一轮 / 看日志（推荐第一次用）
-    python -m app.main --once     # 跑一轮就退出（**推荐**：交给 cron / 计划任务）
-    python -m app.main --loop     # 常驻，按 CLIENT_POLL_SECONDS 定期跑
-    python -m app.main --status   # 只看配置、源库、镜像、身份，不写任何东西
+    python -m app.main --ui           # 本机 Web UI：配置 / 跑一轮 / 看日志（推荐第一次用）
+    python -m app.main --once         # 跑一轮就退出（**推荐**：交给 cron / 计划任务）
+    python -m app.main --loop         # 常驻，按 CLIENT_POLL_SECONDS 定期跑
+    python -m app.main --status       # 只看配置、源库、镜像、身份，不写任何东西
+    python -m app.main --mark-unread  # 把镜像里已处理的标成未读（下一轮重抽一遍）
 
 **推荐用 `--once` + 计划任务**：这个客户端本来就是批处理的，把调度交给操作系统
 比让它常驻更省心（也不会有"进程活着但其实卡住了"这种最难发现的故障）。
 `--loop` 只是给不方便配计划任务的人一个选择，`--ui` 是给"想点着用"的人。
+
+`--mark-unread` 回答的是"我想让它把消息**再处理一遍**"：它只动镜像文件（不碰后端、
+不读源库），把这些记录的"已读"改回"未读"，于是下一轮会**重新走一遍流水线 ——
+包括重新调用模型抽取**。标完就退出，不顺手跑一轮（重抽要花钱，什么时候开始由人定）；
+页面上的"标为未读并重新处理"是同一个动作 + 立刻跑一轮。
 
 （以前还有 `--prepare` / `--dry-run` / `--since-hours` / `--limit` / `--log-level`。
 它们都去掉了：前两个是"多看一步"的辅助模式，实际上没人用；后三个是把写死的常量
@@ -59,7 +65,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="只跑一轮就退出（推荐配合计划任务）")
     mode.add_argument("--loop", action="store_true", help="常驻，按 CLIENT_POLL_SECONDS 定期跑")
-    mode.add_argument("--status", action="store_true", help="只做自检与统计，不写任何东西")
+    mode.add_argument(
+        "--status", action="store_true", help="只做自检与统计，不写任何东西"
+    )
+    mode.add_argument(
+        "--mark-unread",
+        action="store_true",
+        help="把镜像里已经处理过的消息标成未读（下一轮重新抽一遍），标完就退出",
+    )
     mode.add_argument(
         "--ui",
         action="store_true",
@@ -73,7 +86,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> int:
     """自检 + 现状。**一个写请求都不发。**"""
-    from .mirror import Mirror
+    from .mirror import STATE_REPROCESS, Mirror
 
     print("=== 配置 ===")
     print(f"  后端            {settings.backend_base}")
@@ -161,11 +174,17 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
             )
     except SourceDatabaseError as exc:
         print(f"  没读过的消息    算不出来：{exc}")
-    unfinished = mirror.unfinished()
+    unfinished = [row for row in mirror.unfinished() if row.state != STATE_REPROCESS]
     if unfinished:
         print(f"  ⚠️ 有 {len(unfinished)} 条没处理完（下一轮会重试）")
         for row in unfinished[:5]:
             print(f"      · {row.msg_id}  state={row.state}  error={row.last_error or '-'}")
+    waiting = int(stats["by_state"].get(STATE_REPROCESS, 0))
+    if waiting:
+        print(
+            f"  ⚠️ 有 {waiting} 条被标成未读：下一轮会**重新抽一次**"
+            "（会重新花模型的钱）"
+        )
 
     print("\n=== 后端 ===")
     health = await backend.health()
@@ -195,6 +214,54 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
     return 0
 
 
+def mark_unread_command(settings) -> int:
+    """`--mark-unread`：把镜像里的记录标成**未读**，让下一轮重新处理它们。
+
+    只动镜像文件，**不碰后端、也不读源库** —— 所以这个命令可以在任何地方安全地跑
+    （后端挂了、源库在被导出工具写着都不影响）。
+
+    标完**就退出**，不顺手跑一轮：重抽是要花钱的（每条一次模型调用），
+    什么时候开始花应该由人决定。下一轮 `--once` / `--loop` / 页面上的"跑一轮"
+    会先处理它们（`unfinished()` 把它们排在前面）。
+    """
+    from .mirror import Mirror
+
+    path = settings.resolved_mirror_path
+    store = Mirror(path)
+    before = store.stats()
+    if not before["total"]:
+        print(f"=== 标为未读 ===\n  镜像库          {path}\n  里面一条记录都没有。")
+        print(
+            "  「未读」是相对镜像而言的：还没有记录 = 全部都没读过，"
+            "下一轮本来就会从头读一遍，不需要标。\n"
+            "  如果你以为跑过很多轮了，检查一下 CLIENT_MIRROR_PATH 是不是指到了别的地方。"
+        )
+        return 0
+    try:
+        result = store.mark_unread()
+    except Exception as exc:  # noqa: BLE001 - 镜像坏了要说清楚，不能只留个堆栈
+        logger.error("标为未读失败（镜像 %s）：%s: %s", path, type(exc).__name__, exc)
+        return 2
+    print("=== 标为未读 ===")
+    print(f"  镜像库          {path}")
+    print(f"  里面原来有      {before['total']} 条（{before['by_state']}）")
+    print(f"  本次新标记      {result['marked']} 条")
+    print(f"  待重新处理      {result['total']} 条 —— 下一轮会重新走一遍流水线，")
+    print("                  包括**重新调用模型抽取**（这是要花钱的那一步）")
+    if result["dropped"]:
+        print(f"  （顺带清掉了 {result['dropped']} 条旧版本留下的「白名单跳过」记录）")
+    if result["marked"]:
+        print("\n  接下来：python -m app.main --once（或 --loop / 页面上的「跑一轮」）")
+        print(
+            f"  一轮最多处理 {MAX_MESSAGES_PER_CYCLE} 条"
+            "（见 app/config.py 的 MAX_MESSAGES_PER_CYCLE），超过的下一轮接着做；"
+            "`--status` 里能看到还剩多少。"
+        )
+    else:
+        print("\n  没有新标记的：这些记录本来就都在等着重新处理。")
+    return 0
+
+
 def _run_one_cycle(settings):
     """跑一轮（含"先把源库准备好"），返回 `CycleReport`。
 
@@ -212,17 +279,26 @@ def _run_one_cycle(settings):
     db.inspect()   # 库不对就地抛 SourceDatabaseError，由调用方决定怎么说
 
     backend = BackendClient(settings)
-    try:
-        return asyncio.run(
-            run_cycle(
+
+    async def _cycle():
+        # **跑循环和关连接必须在同一个事件循环里**。以前是
+        # `asyncio.run(run_cycle(...))` 之后再来一次 `asyncio.run(backend.close())`：
+        # 第二个 `asyncio.run` 会**新建**一个事件循环，而 httpx 连接池里的连接是绑在
+        # 上一个（已经关掉的）循环上的，于是 `transport.close()` 里那句
+        # `loop.call_soon(...)` 抛 `RuntimeError: Event loop is closed` ——
+        # 而它出现在 finally 里，会把**已经跑完的那一轮**整体说成"这一轮失败"
+        # （返回值被异常顶掉，Report 也没了）。走代理（HTTPS_PROXY）时必现。
+        try:
+            return await run_cycle(
                 backend,
                 settings,
                 db=db,
                 resolver=AttachmentResolver(settings.resolved_attachment_root),
             )
-        )
-    finally:
-        asyncio.run(backend.close())
+        finally:
+            await backend.close()
+
+    return asyncio.run(_cycle())
 
 
 async def run_once(backend: BackendClient, settings) -> int:
@@ -255,9 +331,15 @@ async def amain(args: argparse.Namespace) -> int:
             lambda: serve(args.host, args.port, open_browser=not args.no_browser),
         )
 
+    # 「标为未读」只动镜像文件：不需要后端可达，也不需要源库配好
+    # （后端挂着、导出工具正在写源库，都能标）。所以它排在这些检查前面。
+    if args.mark_unread:
+        return mark_unread_command(settings)
+
     if not settings.backend_base_url:
         logger.error("没有配置 BACKEND_BASE_URL")
         return 2
+
     if not settings.client_db_path and not settings.ntmsg_pipeline_enabled:
         logger.error(
             "既没有配置 CLIENT_NT_MSG_DB，也没有配置 CLIENT_DB_PATH。二选一：\n"

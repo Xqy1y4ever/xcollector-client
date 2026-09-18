@@ -33,7 +33,20 @@
     skipped  判定为不需要（闲聊、源库缺字段）—— 也是终态，不再重试
     failed   处理失败，下轮重试
 
-**白名单外的消息不在这里**：白名单下推到 SQL 了（扫描根本不碰它们），所以
+## 第五态 `reprocess`：用户把"已读"改回"未读"
+
+"把当前消息标成未读、让它重新处理一遍"是这个客户端需要的一个动作（换了抽取器、
+改了提示词、怀疑上一遍抽坏了）。它是**第五个状态**而不是"删掉那几行"，理由是
+删掉会丢掉两件必须留住的事：
+
+1. **是谁标的**。删掉之后，那些消息看起来和"镜像被删过/换了机器"完全一样，
+   于是 `run_cycle` 里那条"后端已经有通知就跳过抽取"的保命捷径会把它们**静默跳过** ——
+   用户以为重新处理了，实际上一次模型调用都没发生（这正是这套系统最怕的静默）。
+   记成 `reprocess` 之后，重跑时明确知道"这条是用户要求重抽的"，于是绕过那条捷径。
+2. **它还没做完**。`reprocess` 和 pending/failed 一样进 `unfinished()`：进程中途
+   退出、这一轮预算用完，下一轮接着做，不会丢。
+
+白名单外的消息不在这里**：白名单下推到 SQL 了（扫描根本不碰它们），所以
 "镜像 = 白名单内我处理过的那些"。镜像里只可能剩下旧版本留下的白名单记录，
 由 `drop_whitelist_skips()` 每次循环清一次。
 
@@ -59,8 +72,13 @@ STATE_PENDING = "pending"
 STATE_DONE = "done"
 STATE_SKIPPED = "skipped"
 STATE_FAILED = "failed"
+STATE_REPROCESS = "reprocess"   # 用户标成未读：下一轮**重新抽一次**
 
 TERMINAL_STATES = (STATE_DONE, STATE_SKIPPED)
+
+# 标为未读时写进 `last_error` 的那句话。它是**给人在界面上看的**（`--status` 会
+# 把它打出来），不是错误 —— 所以措辞要说清楚"这是谁要求的、接下来会发生什么"。
+MARK_UNREAD_REASON = "用户标为未读：下一轮重新抽一次（会重新花模型的钱）"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS message (
@@ -240,13 +258,74 @@ class Mirror:
         return value or None
 
     def unfinished(self) -> list[MirrorRow]:
-        """还没处理完的（pending/failed）—— 崩溃恢复与失败重试靠它。"""
+        """还没做完的：pending / failed（崩溃恢复 + 失败重试）**和 reprocess**。
+
+        `reprocess` 是"用户标成未读、要求重抽"的那些（见 `mark_unread`）。它们必须
+        走这里、而不是"扫没读过的"那条路 —— 后者靠"镜像里有没有这一行"判断，
+        而它们**在**镜像里（这正是我们要的信息：哪些是用户点名要重做的）。
+        """
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT * FROM message WHERE state IN (?,?) ORDER BY source_ts ASC",
-                (STATE_PENDING, STATE_FAILED),
+                "SELECT * FROM message WHERE state IN (?,?,?) ORDER BY source_ts ASC",
+                (STATE_PENDING, STATE_FAILED, STATE_REPROCESS),
             ).fetchall()
         return [_row(r) for r in rows]
+
+    def mark_unread(self, msg_ids: Iterable[str] | None = None) -> dict:
+        """把已经处理过的记录标成**未读**，下一轮会**重新处理**它们（真的重抽）。
+
+        参数不给 = 镜像里**全部**记录；给了 `msg_ids` = 只标这些（不存在的 id 不算数，
+        也不会凭空建行 —— "未读"必须有源头那条消息，凭空造行只会造出一个永远
+        处理不了的东西）。
+
+        返回 `{"marked": 本次新标的, "total": 标完之后总共待重新处理的, "dropped": 清掉的旧垃圾}`。
+        **三个数都要给出来**：只报"标了 0 条"而不同时说"本来就有 109 条在排队"，
+        会让人以为没生效。
+
+        两个诚实的边界：
+
+        * **别和正在跑的那一轮同时用**。一边标、另一边正好把这条处理完，`finish()`
+          会把状态改成 done/skipped，这一条的记号就没了（页面上运行中直接拒绝）。
+        * **重新处理会重传附件**：后端附件按 id 存、没有内容去重，所以一条带图的消息
+          重抽一次就多一份附件字节。消息带附件不多时无所谓，介意的话就别整库重来。
+        """
+        ids = None if msg_ids is None else [str(i) for i in msg_ids]
+        if ids is not None and not ids:
+            return {
+                "marked": 0,
+                "total": int(self.stats()["by_state"].get(STATE_REPROCESS, 0)),
+                "dropped": 0,
+            }
+
+        # 旧版本留下的"白名单跳过"记录先清掉：它们不是"处理过的东西"，
+        # 标成未读只会让一个已经不看来源的消息被重新抽一遍（纯浪费 + 噪音）。
+        dropped = self.drop_whitelist_skips()
+        stamp = now_ms()
+        marked = 0
+        with closing(self._connect()) as conn:
+            if ids is None:
+                cur = conn.execute(
+                    "UPDATE message SET state=?, attempts=0, last_error=?, updated_at=?"
+                    " WHERE state != ?",
+                    (STATE_REPROCESS, MARK_UNREAD_REASON, stamp, STATE_REPROCESS),
+                )
+                marked = int(cur.rowcount or 0)
+            else:
+                for start in range(0, len(ids), 500):   # 避开 SQLite 的参数上限
+                    chunk = ids[start : start + 500]
+                    marks = ",".join("?" * len(chunk))
+                    cur = conn.execute(
+                        "UPDATE message SET state=?, attempts=0, last_error=?, updated_at=?"
+                        f" WHERE state != ? AND msg_id IN ({marks})",
+                        (STATE_REPROCESS, MARK_UNREAD_REASON, stamp, STATE_REPROCESS, *chunk),
+                    )
+                    marked += int(cur.rowcount or 0)
+            conn.commit()
+        return {
+            "marked": marked,
+            "total": int(self.stats()["by_state"].get(STATE_REPROCESS, 0)),
+            "dropped": dropped,
+        }
 
     def stats(self) -> dict:
         with closing(self._connect()) as conn:

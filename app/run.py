@@ -18,6 +18,8 @@
 1. **先把没做完的做完**（`mirror.unfinished()`）。它们可能落在很老的位置，
    靠"扫没读过的"永远扫不到 —— 不先捞它们，失败的消息就永远卡在那儿。
    顺便：`pending` 只可能来自"上一次没跑完就退出了"，所以这一步同时就是崩溃恢复。
+   这一步还会捞 `reprocess`（用户标成未读、要求重抽的那些，见 `mirror.mark_unread`）：
+   它们**在**镜像里，只是要求重做，所以只能从这里进来。
 2. **再扫没读过的**（按时间正序）。从最老的开始，一条条处理到本轮预算用完为止；
    剩下的下一轮接着读（`--status` 会告诉你还剩多少）。
 
@@ -27,6 +29,10 @@
     后端通知集合   只对"镜像不认识的"消息查一次：镜像被删了/换机器了也不会
                    把整段历史重新抽一遍（那是真金白银的模型调用）
     后端幂等键     (user_id, raw_message_id) —— 最后一道，保证不会重复入库
+
+第二层有个**例外**：用户点名标成未读的那些（`reprocess`）会绕过它 ——
+不绕过的话，"重新处理"就成了"什么都不做"（用户点了按钮，日志一切正常，
+模型一次没调）。重抽的结果由后端幂等键落到原来那条通知上，不会多出一条。
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ from .mirror import (
     STATE_DONE,
     STATE_FAILED,
     STATE_PENDING,
+    STATE_REPROCESS,
     STATE_SKIPPED,
     Mirror,
 )
@@ -88,6 +95,8 @@ class CycleReport:
     dropped_whitelist_rows: int = 0
     unchanged: int = 0
     recovered: int = 0
+    # 其中有多少条是"用户标了未读、这轮真的重抽了一遍"的（见 mirror.mark_unread）
+    reprocessed: int = 0
     outcomes: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     # 这一轮的"解密 + 导出"做了什么（没配 CLIENT_NT_MSG_DB 时是 None）
@@ -205,8 +214,14 @@ async def _handle_one(
     mirror: Mirror,
     known_raw_ids: set[str],
     report: CycleReport,
+    *,
+    force: bool = False,
 ) -> Outcome:
     """处理一条消息（白名单 → 抽取 → 建通知），并把它记进镜像。
+
+    `force=True` 表示这条是**用户标成未读、要求重抽**的（镜像状态 `reprocess`）：
+    下面会把它透传给 `process_message`，让那条"后端已经有通知就跳过抽取"的捷径
+    失效 —— 不然"重新处理"就只是把状态改回 done，一次模型都没调。
 
     ## 白名单在这里只是**兜底**
 
@@ -238,7 +253,7 @@ async def _handle_one(
         return Outcome(result=OUTCOME_SKIPPED, reason=reason)
 
     outcome = await process_message(
-        message, backend, settings, resolver, known_raw_ids=known_raw_ids
+        message, backend, settings, resolver, known_raw_ids=known_raw_ids, force=force
     )
     # 后端已经有这条通知（镜像被删过/换机器时会走到这里）→ 补记成 done，
     # 于是下一轮连这次查询都省了
@@ -317,17 +332,19 @@ async def run_cycle(
     budget = MAX_MESSAGES_PER_CYCLE
     stats: dict[str, int] = {}
 
-    async def handle_one(message: SourceMessage, *, recovered: bool) -> None:
+    async def handle_one(message: SourceMessage, *, recovered: bool, force: bool = False) -> None:
         """处理一条消息，并在这一轮的报告/统计里记一笔。"""
         nonlocal stats
         report.scanned += 1
         if recovered:
             report.recovered += 1
+        if force:
+            report.reprocessed += 1
         store.claim(message)      # 先记账再干活（崩了最多重做一次）
         try:
             outcome = await _handle_one(
                 message, backend, settings, attachment_resolver, store,
-                known_raw_ids, report,
+                known_raw_ids, report, force=force,
             )
         except Exception as exc:  # 单条炸了不能拖垮整批
             logger.exception("处理消息失败 msg_id=%s", message.msg_id)
@@ -356,20 +373,34 @@ async def run_cycle(
                 # 镜像里存的是**秒**（源库的单位），缺口判据是毫秒
                 await _maybe_gap(backend, settings, message, int(previous_ts) * 1000, report)
 
-    # ---- 1) 先把没做完的做完（崩溃恢复 + 失败重试）----
+    # ---- 1) 先把没做完的做完（崩溃恢复 + 失败重试 + 用户点名要重抽的）----
     # 它们可能落在很老的位置，靠"扫没读过的"永远扫不到。
-    retry_ids = [row.msg_id for row in store.unfinished()][:MAX_MESSAGES_PER_CYCLE]
-    if retry_ids:
-        logger.info("有 %d 条没处理完的消息，先重试它们", len(retry_ids))
-        fetched = database.fetch_by_ids(retry_ids)
-        for msg_id in retry_ids:
-            message = fetched.get(msg_id)
+    pending_rows = store.unfinished()
+    first_batch = pending_rows[:MAX_MESSAGES_PER_CYCLE]
+    if pending_rows:
+        by_state: dict[str, int] = {}
+        for row in pending_rows:
+            by_state[row.state] = by_state.get(row.state, 0) + 1
+        logger.info(
+            "有 %d 条要先处理（%s；本轮最多 %d 条）：pending/failed 是没做完的重试，"
+            "reprocess 是用户标成未读、要求重抽的",
+            len(pending_rows),
+            ", ".join(f"{k}={v}" for k, v in sorted(by_state.items())),
+            len(first_batch),
+        )
+    if first_batch:
+        fetched = database.fetch_by_ids([row.msg_id for row in first_batch])
+        for row in first_batch:
+            # "用户点名要重抽"这件事只存在于镜像的状态里，`fetch_by_ids` 拿不到它 ——
+            # 所以 force 从**行**上取，别弄丢了（弄丢 = 静默地不重抽）。
+            force = row.state == STATE_REPROCESS
+            message = fetched.get(row.msg_id)
             if message is None:
                 # 源库里已经没有这条了（换了导出库？）→ 记成跳过，不要永远卡着
-                store.finish(msg_id, state=STATE_SKIPPED, error="源库里已经查不到这条消息")
-                logger.warning("镜像里的 %s 在源库里已经不存在，标记为跳过", msg_id)
+                store.finish(row.msg_id, state=STATE_SKIPPED, error="源库里已经查不到这条消息")
+                logger.warning("镜像里的 %s 在源库里已经不存在，标记为跳过", row.msg_id)
                 continue
-            await handle_one(message, recovered=True)
+            await handle_one(message, recovered=True, force=force)
             budget -= 1
             if budget <= 0:
                 break
@@ -452,10 +483,11 @@ def _merge(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
 def log_report(report: CycleReport) -> None:
     """把一次循环的结果打成一行（+ 出错时的明细）。"""
     logger.info(
-        "本轮：扫了 %d 条（其中重试 %d 条），跳过 %d 条已经处理过的、%d 条白名单外的，"
-        "结果=%s",
+        "本轮：扫了 %d 条（其中重试 %d 条、用户标了未读重抽 %d 条），跳过 %d 条已经处理过的、"
+        "%d 条白名单外的，结果=%s",
         report.scanned,
         report.recovered,
+        report.reprocessed,
         report.unchanged,
         report.skipped_whitelist,
         report.outcomes or {},
@@ -475,6 +507,9 @@ def log_report(report: CycleReport) -> None:
             report.mirror_after.get("total", 0),
             report.mirror_after.get("by_state", {}),
         )
+    waiting = int((report.mirror_after.get("by_state") or {}).get(STATE_REPROCESS, 0))
+    if waiting:
+        logger.info("还有 %d 条被标成未读、等着重抽（下一轮接着做）", waiting)
     for message in report.errors[:5]:
         logger.warning("  · %s", preview(message, 200))
     if len(report.errors) > 5:

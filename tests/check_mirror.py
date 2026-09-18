@@ -1,17 +1,18 @@
-"""镜像库：状态机、内容指纹、补充关系。
+"""镜像库：状态机、未读标记、缺口检测用的"上一条"。
 
     .\\venv\\Scripts\\python.exe -m tests.check_mirror
 
 ## 这个文件守的是什么
 
-镜像库是客户端**唯一**的本地状态，`run.py` 的整个增量逻辑都建在它的四个返回值上
-（`new` / `changed` / `retry` / `unchanged`）。这四个判断错任何一个，后果都是静默的：
+镜像库是客户端**唯一**的本地状态：`run.py` 判断"这条要不要处理"完全靠它，
+判错任何一个状态的后果都是静默的：
 
-  - 把 `changed` 判成 `unchanged` → 通知被补充/编辑之后**任务永远不更新**；
-  - 把 `unchanged` 判成 `changed` → 每轮都重新抽一遍，白花模型的钱；
-  - 把 `retry` 判成 `unchanged` → 失败的消息永远不再试，**漏掉一条通知**。
+  - 把 `done` 当成"还要处理" → 每轮都重新抽一遍，白花模型的钱；
+  - 把 `failed` 当成"处理好了" → 失败的消息永远不再试，**漏掉一条通知**；
+  - 把"用户标了未读"当成普通的已读 → 用户点了"重新处理"，日志一切正常，
+    实际上一次模型调用都没发生（**这就是最坏的那种错**，见第 11 节）。
 
-所以这里逐条把四种判定、指纹的稳定性、以及"先记账再干活"的顺序都钉住。
+所以这里逐条把五个状态、标记未读的边界、以及"先记账再干活"的顺序都钉住。
 不联网、不碰后端，用临时目录里的库跑。
 """
 
@@ -25,6 +26,7 @@ from app.mirror import (
     STATE_DONE,
     STATE_FAILED,
     STATE_PENDING,
+    STATE_REPROCESS,
     STATE_SKIPPED,
     Mirror,
 )
@@ -177,6 +179,59 @@ def main() -> int:  # noqa: C901
     gm.claim(msg("g1-4", ts=88000, group_id="g1"))
     gm.finish("g1-4", state=STATE_SKIPPED, error="闲聊")
     check("因为别的原因跳过的算见过（群里确实有消息）", gm.group_seen_ts("g1"), 88000)
+
+    # ------------------------------------------------------------------
+    print("\n--- 11. 标为未读：已读 → reprocess（下一轮重新抽一遍）---")
+    # 用户要的是"把当前消息标成未读，让它全部重新处理一次"。做成一删了之是不行的：
+    # 删掉之后那些消息看起来和"镜像被删过/换机器了"一模一样，`run_cycle` 里那条
+    # "后端已经有通知就跳过抽取"的保命捷径会把它们**静默跳过** —— 用户以为重跑了，
+    # 其实一次模型调用都没发生。所以这里是一个**状态**，不是一个删除。
+    un_dir = ROOT / ".tmp-test" / "mirror-unread"
+    un_dir.mkdir(parents=True, exist_ok=True)
+    un_db = un_dir / "unread.db"
+    if un_db.exists():
+        un_db.unlink()
+    um = Mirror(un_db)
+    um.claim(msg("u1", ts=1000))
+    um.finish("u1", state=STATE_DONE, raw_id="raw-u1")
+    um.claim(msg("u2", ts=2000))
+    um.finish("u2", state=STATE_SKIPPED, error="闲聊")
+    um.claim(msg("u3", ts=3000))
+    um.finish("u3", state=STATE_FAILED, error="后端 502")
+    um.claim(msg("u4", ts=4000))
+    um.finish("u4", state=STATE_SKIPPED, error="whitelist:group 群 g1 不在名单里")
+
+    res = um.mark_unread()
+    check("本次标了 3 条（旧版本的白名单垃圾先被清掉，不算在内）", res["marked"], 3)
+    check("清掉了 1 条白名单跳过记录", res["dropped"], 1)
+    check("标完之后共 3 条等着重抽", res["total"], 3)
+    check("done → reprocess", um.get("u1").state, STATE_REPROCESS)
+    check("skipped（闲聊）→ reprocess：用户说重看就重看", um.get("u2").state, STATE_REPROCESS)
+    check("failed → reprocess（它本来就要重试，现在连抽取也重来）", um.get("u3").state, STATE_REPROCESS)
+    check("白名单那条是被**删掉**的，不是被标成未读", um.get("u4"), None)
+    check("raw_id 留着（重抽时靠它认后端那条原文）", um.get("u1").raw_id, "raw-u1")
+    check(
+        "reprocess 进未完成队列（否则它永远轮不到）",
+        {r.msg_id for r in um.unfinished()},
+        {"u1", "u2", "u3"},
+    )
+    check("标记写下了原因（界面上要能看出这是谁要求的）", "标为未读" in (um.get("u1").last_error or ""), True)
+
+    res2 = um.mark_unread()
+    check("再标一次：没有新标上的（幂等，不会把计数越滚越大）", res2["marked"], 0)
+    check("但「等着重抽」还是 3 —— 这个数才是用户关心的", res2["total"], 3)
+
+    print("\n--- 12. 只标指定的那几条 / 空列表不等于「全部」---")
+    um.finish("u1", state=STATE_DONE, raw_id="raw-u1")   # 模拟 u1 已经被重抽完了
+    res3 = um.mark_unread(["u1", "根本没有这条"])
+    check("只标点名的那条", res3["marked"], 1)
+    check("不存在的 id 不会凭空建行（未读必须有源头那条消息）", um.get("根本没有这条"), None)
+    check("没被点名的仍然是 reprocess（状态没被动过）", um.get("u2").state, STATE_REPROCESS)
+    check("点名的那条回到 reprocess", um.get("u1").state, STATE_REPROCESS)
+
+    before_empty = um.get("u2").state
+    check("空列表 = 什么都不标（不是「全部」）", um.mark_unread([])["marked"], 0)
+    check("空列表之后状态没变", um.get("u2").state, before_empty)
 
     print()
     if fails:

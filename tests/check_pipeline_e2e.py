@@ -19,6 +19,8 @@
 4. **镜像就是增量状态**：处理过的不再重看、白名单外的记终态。
    判据是「读没读过」，**不是时间**。
 5. **一条消息失败不能拖垮整批**，而且失败要留在报告/镜像里（不静默）。
+6. **"标为未读"要真的重抽一遍**（第 14 节）：不绕过"后端已经有通知就跳过抽取"
+   那条捷径的话，用户点了"重新处理"会变成"什么都不做" —— 而这正是最坏的错法。
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ import httpx
 
 from app.backend_client import BackendClient
 from app.config import Settings
-from app.mirror import STATE_DONE, STATE_SKIPPED, Mirror
+from app.mirror import STATE_DONE, STATE_FAILED, STATE_REPROCESS, STATE_SKIPPED, Mirror
 from app.run import run_cycle, verify_identity
 from app.source.attachments import AttachmentResolver
 from app.source.ntmsg import SourceDatabase
@@ -470,6 +472,77 @@ async def run_all() -> int:  # noqa: C901
                        int(report.outcomes.get("error") or 0) >= 1, str(report.outcomes))
         finally:
             await backend_bad.close()
+
+        # ----------------------------------------------------------------
+        print("\n--- 14. 标为未读 → 下一轮**真的重新抽一遍**（就地更新，不多出一行）---")
+        # 用户要的动作："把当前消息标成未读，让它全部重新处理一次"。
+        # 这条链路里有一个坑：`process_message` 撞见"后端已经有这条通知"时会跳过抽取
+        # （那是为了镜像被删掉之后不白花模型的钱）。所以"标为未读"必须把这条捷径
+        # 关掉，否则用户点了按钮、日志一切正常、而实际上什么都没发生。
+        db_re = SCRATCH / f"e2e-re-{RUN}.db"
+        mirror_re_path = SCRATCH / f"mirror-re-{RUN}.db"
+        mirror_re = Mirror(mirror_re_path)
+        settings_re = make_settings(token, db_re, client_mirror_path=str(mirror_re_path))
+        backend_re = BackendClient(settings_re)
+        try:
+            make_source_db(db_re, [
+                {"msg_id": "700", "ts": BASE_TS + 7000, "text": "下周三前交材料",
+                 "content": text_of("下周三前交材料")},
+            ])
+            report = await run_cycle(
+                backend_re, settings_re, db=SourceDatabase(db_re), mirror=mirror_re
+            )
+            check("先正常处理一次", report.outcomes.get("extracted"), 1)
+            check("镜像里是 done", mirror_re.get("700").state, STATE_DONE)
+            raw_id = mirror_re.get("700").raw_id
+            count_before = len(notifications(token))
+            title_before = [n for n in notifications(token) if n.get("raw_message_id") == raw_id][0].get("title")
+
+            marked = mirror_re.mark_unread()
+            check("标为未读：标上了 1 条", marked["marked"], 1)
+            check("镜像里变成 reprocess（不是被删掉）", mirror_re.get("700").state, STATE_REPROCESS)
+
+            # 把源库里这条的正文改掉（同一条消息，内容变了），再重抽 ——
+            # "通知标题跟着变"是"真的重抽了"最硬的证据：只走捷径的话标题一直是旧的。
+            make_source_db(db_re, [
+                {"msg_id": "700", "ts": BASE_TS + 7000, "text": "本周五19:00在教三201开班会",
+                 "content": text_of("本周五19:00在教三201开班会")},
+            ])
+            report = await run_cycle(
+                backend_re, settings_re, db=SourceDatabase(db_re), mirror=mirror_re
+            )
+            check("这一轮把它是当成「重抽」处理的", report.reprocessed, 1)
+            check("而且真的抽了（不是走「已经建过通知」那条路）",
+                  report.outcomes.get("extracted"), 1)
+            check("没有多出一条通知（后端按 (用户, 原文) 幂等更新）",
+                  len(notifications(token)), count_before)
+            after = [n for n in notifications(token) if n.get("raw_message_id") == raw_id]
+            check("还是那一条（raw id 没变）", len(after), 1)
+            check_true(
+                "标题跟着新正文变了 —— 这就是「真的重抽了」",
+                "教三201" in str(after[0].get("title") if after else ""),
+                f"改前={title_before!r} 改后={after[0].get('title') if after else None!r}",
+            )
+            check("镜像回到 done", mirror_re.get("700").state, STATE_DONE)
+
+            report = await run_cycle(
+                backend_re, settings_re, db=SourceDatabase(db_re), mirror=mirror_re
+            )
+            check("再跑一轮：不再重抽（标为未读是一次性的）", report.processed, 0)
+            check("重抽计数也归零", report.reprocessed, 0)
+
+            # 反例：`failed` 的重试**不**绕过那条捷径。否则每次失败重试都重抽一遍，
+            # 那是白花钱 —— "绕过捷径"只属于"用户点名要求"这一个来源。
+            mirror_re.finish("700", state=STATE_FAILED, error="模拟一次失败")
+            report = await run_cycle(
+                backend_re, settings_re, db=SourceDatabase(db_re), mirror=mirror_re
+            )
+            check("failed 的重试不算重抽", report.reprocessed, 0)
+            check_true("它走的是便宜的捷径（「已经建过通知」）",
+                       report.unchanged >= 1, f"unchanged={report.unchanged} outcomes={report.outcomes}")
+            check("于是也回到 done（不再每轮重试）", mirror_re.get("700").state, STATE_DONE)
+        finally:
+            await backend_re.close()
 
     finally:
         await backend.close()

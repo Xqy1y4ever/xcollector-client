@@ -9,6 +9,7 @@
     POST /api/config/cleanup  把不是配置项的键注释掉
     POST /api/run          跑一轮（mode=once）或开始自动跑（mode=auto）
     POST /api/stop         停止自动跑（正在跑的那一轮做完了就停）
+    POST /api/mark-unread  把镜像里的记录标成未读（下一轮重抽一遍），可顺带跑一轮
     GET  /api/log          最近的日志（内存里留最后 N 条）
 
 页面用轮询（1.5s）而不是 SSE/WebSocket：逻辑少、断了也能自己恢复，
@@ -38,7 +39,7 @@ from typing import Any
 
 from ..backend_client import BackendClient, BackendError
 from ..config import MAX_MESSAGES_PER_CYCLE, get_settings, unknown_env_keys
-from ..mirror import Mirror
+from ..mirror import STATE_REPROCESS, Mirror
 from ..run import verify_identity
 from ..source.ntmsg import SourceDatabase, SourceDatabaseError
 from ..utils import now_ms
@@ -153,6 +154,7 @@ def _report_dict(report) -> dict:
         "processed": report.processed,
         "unchanged": report.unchanged,
         "recovered": report.recovered,
+        "reprocessed": report.reprocessed,
         "skipped_whitelist": report.skipped_whitelist,
         "dropped_whitelist_rows": report.dropped_whitelist_rows,
         "unread_before": report.unread_before,
@@ -277,6 +279,10 @@ async def _collect_state() -> dict:
             "path": str(settings.resolved_mirror_path),
             **stats,
             "unfinished": len(mirror.unfinished()),
+            # 单独给一个数：它和"没读过的"是两件事 —— 这些消息在镜像里**有**记录，
+            # 只是被（人或上一轮）要求重做。页面上不显示的话，用户点了"标为未读"
+            # 之后会看到"没读过 0 条"，以为没生效。
+            "reprocess": int(stats["by_state"].get(STATE_REPROCESS, 0)),
             "watermark": mirror.watermark(),
         }
     except Exception as exc:  # noqa: BLE001 - 状态页不该因为镜像坏了就打不开
@@ -463,12 +469,67 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"started": started, "message": message}, 200 if started else 409)
             if path == "/api/stop":
                 return self._json({"message": stop_run()})
+            if path == "/api/mark-unread":
+                return self._mark_unread(body)
             return self._error("没有这个接口", HTTPStatus.NOT_FOUND)
         except ValueError as exc:
             return self._error(str(exc), HTTPStatus.BAD_REQUEST)
         except Exception as exc:  # noqa: BLE001
             logger.exception("UI POST %s 失败", path)
             return self._error(f"{type(exc).__name__}: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    # ---- 标为未读 ----
+
+    def _mark_unread(self, body: dict) -> None:
+        """把镜像里的记录标成未读（= 下一轮重新处理它们）。
+
+        三条刻意的限制：
+
+        * **正在跑的时候拒绝**（409）：一边跑一边标，正在处理的那几条会被这一轮的
+          结果（done/skipped）覆盖掉，用户以为标上了、其实只标了一半。
+        * **默认不顺手跑一轮**（`run` 得显式给 true）：重抽要花模型的钱，
+          这个动作本身只该改状态。页面上那个按钮会显式传 true（它就叫
+          "标为未读并重新处理"），并且先弹一个确认框把要花多少钱说清楚。
+        * **数要说全**：返回"本次新标记"和"标完之后总共待重抽"两个数。只回一个
+          "标了 0 条"会让人以为没生效，而其实是它们早就在队列里了。
+        """
+        if RUNNER.mode != "idle":
+            return self._error(
+                "正在跑（%s）：先等这一轮跑完再标 —— 一边跑一边标，"
+                "正在处理的那几条会被这一轮的结果覆盖掉，看起来像标上了其实没有。" % RUNNER.mode,
+                HTTPStatus.CONFLICT,
+            )
+        msg_ids = body.get("msg_ids")
+        if msg_ids is not None and not isinstance(msg_ids, list):
+            return self._error("msg_ids 要么不给（= 全部），要么给一个数组")
+
+        settings = get_settings()
+        store = Mirror(settings.resolved_mirror_path)
+        try:
+            result = store.mark_unread(msg_ids)
+        except Exception as exc:  # noqa: BLE001 - 镜像坏了要在页面上看得见
+            logger.exception("标为未读失败")
+            return self._error(f"{type(exc).__name__}: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR)
+
+        logger.info(
+            "标为未读：本次 %d 条，镜像是共 %d 条等着重抽（下一轮会重新调用抽取）",
+            result["marked"],
+            result["total"],
+        )
+        _invalidate_state_cache()
+
+        payload: dict[str, Any] = dict(result)
+        payload["message"] = (
+            f"已标 {result['marked']} 条为未读；镜像里共有 {result['total']} 条等着重新处理"
+        )
+        if body.get("run"):
+            started, message = start_run("once")
+            payload["run_started"] = started
+            payload["run_message"] = message
+            if not started:
+                # 上面已经挡了 busy，这里挡的是"同一瞬间被别的东西抢走了"
+                payload["message"] += f"（没能开始跑：{message}）"
+        return self._json(payload)
 
     # ---- 静态 ----
 

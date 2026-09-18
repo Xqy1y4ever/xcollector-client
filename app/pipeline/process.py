@@ -246,11 +246,21 @@ async def process_message(
     resolver: AttachmentResolver,
     *,
     known_raw_ids: set[str] | None = None,
+    force: bool = False,
 ) -> Outcome:
     """处理一条群消息。返回 Outcome（调用方据此记统计与日志）。
 
     `known_raw_ids`：我已经有通知的 raw id 集合。命中就**跳过抽取** ——
     镜像被删掉之后重扫时，这一个参数决定了要不要把模型的钱再花一遍。
+
+    `force`：**用户点名要求重抽**的那条（镜像里状态是 `reprocess`，见
+    `mirror.mark_unread`）。此时那条"已经有通知就跳过"的捷径**不算数** ——
+    这正是"标为未读"这个动作的意义所在：不绕过它的话，用户点了"重新处理"，
+    日志里一切正常，而实际上一次模型调用都没发生（静默地什么都没做）。
+
+    重抽之后 `POST /api/notifications` 是**幂等 upsert**（后端按
+    `(user_id, raw_message_id)` 唯一，只覆盖机器字段、不动人工修正），
+    所以结果就地更新到那条通知上，不会多出一条。
     """
     text = message_text(message)
     if not message.group_id or not message.sender_id:
@@ -286,7 +296,9 @@ async def process_message(
     # raw 是幂等的，所以这次 POST 顺便当了一次"这条我处理过吗"的查询 ——
     # 客户端没有直接读原文的接口（那会跨用户），用户令牌下这是唯一拿到 raw id
     # 的正当路径。
-    if known_raw_ids and raw_id in known_raw_ids:
+    #
+    # `force`（用户把它标成了未读）时这一步**不做**：他就是来重抽的。
+    if known_raw_ids and raw_id in known_raw_ids and not force:
         return Outcome(
             result=OUTCOME_SKIPPED,
             raw_id=raw_id,

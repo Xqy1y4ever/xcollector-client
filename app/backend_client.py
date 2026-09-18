@@ -1,4 +1,4 @@
-﻿"""后端客户端：**只用 UserToken**，只调用户令牌允许调的那些接口。
+"""后端客户端：**只用 UserToken**，只调用户令牌允许调的那些接口。
 
 ## 为什么这份文件里的方法这么少
 
@@ -78,7 +78,17 @@ class BackendClient:
         )
 
     async def close(self) -> None:
-        await self._client.aclose()
+        """关掉连接池。**不抛异常**。
+
+        关闭是收尾动作：它失败说明不了"刚才那些写入没成功"，所以不该把一轮已经
+        做完的结果说成失败。历史上这里抛过一次 `RuntimeError: Event loop is closed`
+        （在另一个事件循环里关连接池），那一次把**跑完的一轮**整个吞掉了 ——
+        所以这里如实记一行 WARNING，然后让调用方继续。
+        """
+        try:
+            await self._client.aclose()
+        except Exception as exc:  # noqa: BLE001 - 收尾失败不该盖掉业务结果
+            logger.warning("关闭后端连接池失败（已经做完的事不受影响）：%s", exc)
 
     # ------------------------------------------------------------------
     # 底层请求

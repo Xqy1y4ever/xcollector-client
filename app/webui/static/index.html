@@ -94,6 +94,13 @@
       <button class="warnbtn" id="stop">⏹ 停止</button>
       <span class="dim" id="run-msg"></span>
     </div>
+    <div class="row" style="margin-top:10px">
+      <button class="warnbtn" id="mark-unread">↻ 标为未读并重新处理</button>
+      <span class="dim" style="font-size:12px">
+        把镜像里已经处理过的消息改回"未读"，下一轮<b>重新抽一遍</b>（会重新花模型的钱）。
+        同一条通知就地更新，不会多出一条。
+      </span>
+    </div>
     <div id="last-report" class="dim" style="margin-top:10px"></div>
   </section>
 
@@ -162,6 +169,7 @@ const FIELDS = [
 ];
 
 let current = {};   // 最近一次从服务端读到的值
+let currentState = null;  // 最近一次 /api/state（"标为未读"的确认框要用里面的条数）
 
 function renderForm(cfg) {
   current = cfg.values || {};
@@ -231,6 +239,9 @@ function renderState(s) {
     kv("镜像库", mir.error ? `<span class="bad">${esc(mir.error)}</span>`
       : `共 ${mir.total ?? 0} 条 · ${esc(JSON.stringify(mir.by_state || {}))}` +
         (mir.unfinished ? ` · <span class="warn">${mir.unfinished} 条没处理完</span>` : "")),
+    kv("标了未读的", mir.reprocess
+      ? `<span class="warn">${mir.reprocess} 条</span> <span class="dim">（下一轮会重新抽一遍）</span>`
+      : `<span class="dim">没有</span>`),
     kv("本地白名单", c.whitelist_active
       ? `群 ${(c.groups || []).length} 个 · 发送者 ${(c.senders || []).length} 个`
       : `<span class="dim">没配</span>`),
@@ -245,6 +256,7 @@ function renderState(s) {
   const r = run.last_report || {};
   $("last-report").innerHTML = r.finished_at
     ? `上一轮：扫了 ${r.scanned} 条（重试 ${r.recovered}）· 处理 ${r.processed} · ` +
+      (r.reprocessed ? `<b>重抽 ${r.reprocessed} 条</b> · ` : "") +
       `跳过 ${r.unchanged} 条已读过 / ${r.skipped_whitelist} 条白名单外 · ` +
       `结果 ${esc(JSON.stringify(r.outcomes || {}))}` +
       (r.errors && r.errors.length ? ` · <span class="bad">${r.errors.length} 个错误</span>` : "") +
@@ -254,6 +266,8 @@ function renderState(s) {
   $("run-once").disabled = !!run.busy;
   $("run-auto").disabled = !!run.busy;
   $("stop").disabled = !run.busy;
+  // 正在跑的时候不许标：一边跑一边标，正在处理的那几条会被这一轮的结果盖掉
+  $("mark-unread").disabled = !!run.busy;
 }
 
 function kv(k, v) { return `<div class="kv"><span class="k">${k}</span><span class="v">${v}</span></div>`; }
@@ -280,6 +294,7 @@ function renderLog(lines) {
 async function tick() {
   try {
     const [state, log] = await Promise.all([api("/api/state"), api(`/api/log?since=${logSince}`)]);
+    currentState = state;
     renderState(state);
     renderLog(log.lines || []);
     $("hdr").textContent = `已连接 · ${new Date().toLocaleTimeString()}`;
@@ -352,6 +367,41 @@ $("stop").onclick = async () => {
   await tick();
 };
 $("clear-log").onclick = () => { $("log").innerHTML = ""; $("log-count").textContent = ""; };
+
+// 标为未读 = 让这些消息下一轮重新走一遍流水线（真的重抽，会重新花钱）。
+// 所以先弹确认框，并把"到底有多少条"写在里面 —— 用户点的不是一个开关，
+// 是一次会花钱的动作。
+$("mark-unread").onclick = async () => {
+  const mir = (currentState && currentState.mirror) || {};
+  const total = mir.total ?? 0;
+  const already = mir.reprocess ?? 0;
+  if (!total) {
+    $("run-msg").innerHTML = `<span class="warn">镜像里没有记录：还没有处理过任何消息，` +
+      `直接"跑一轮"就是从零读一遍。</span>`;
+    return;
+  }
+  const ok = confirm(
+    `把镜像里的 ${total} 条记录全部标成未读，下一轮会重新走一遍流水线，` +
+    `包括**重新调用模型抽取**（这一步是要花钱的）。\n\n` +
+    (already ? `其中 ${already} 条早就在等着重抽了。\n\n` : "") +
+    `标完会立刻跑一轮（一轮最多 ${currentState?.config?.max_per_cycle ?? "?"} 条，` +
+    `剩下的下一轮接着做）。\n\n` +
+    `同一条通知就地更新，不会多出一条。要继续吗？`
+  );
+  if (!ok) return;
+  $("run-msg").textContent = "标记中…";
+  try {
+    const res = await api("/api/mark-unread", {
+      method: "POST", headers: { "X-XC-UI": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ run: true }),
+    });
+    $("run-msg").innerHTML = `<span class="ok">${esc(res.message || "已标记")}</span>` +
+      (res.run_started ? " · 已开始跑一轮" : ` · <span class="bad">没能开始跑：${esc(res.run_message || "")}</span>`);
+  } catch (err) {
+    $("run-msg").innerHTML = `<span class="bad">标记失败：${esc(err.message)}</span>`;
+  }
+  await tick();
+};
 
 $("origin").textContent = location.host;
 loadConfig().catch((e) => { $("save-msg").innerHTML = `<span class="bad">配置读不出来：${esc(e.message)}</span>`; });
