@@ -154,7 +154,7 @@ def _report_dict(report) -> dict:
         "unchanged": report.unchanged,
         "recovered": report.recovered,
         "skipped_whitelist": report.skipped_whitelist,
-        "reopened": report.reopened,
+        "dropped_whitelist_rows": report.dropped_whitelist_rows,
         "unread_before": report.unread_before,
         "outcomes": report.outcomes or {},
         "errors": list(report.errors[:10]),
@@ -283,8 +283,19 @@ async def _collect_state() -> dict:
         state["mirror"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     if state["source"].get("ok"):
+        groups = tuple(settings.group_whitelist_map)
+        senders = tuple(settings.sender_whitelist_map)
+        state["config"]["groups"] = sorted(groups)
+        state["config"]["senders"] = sorted(senders)
         try:
-            state["unread"] = db.count_unread(settings.resolved_mirror_path)
+            # 白名单**下推到 SQL**：这两个数都只算白名单内的消息。
+            # 页面上要能同时看到"白名单内共 N 条"和"没读过的 M 条" ——
+            # 配了白名单的人不该看到"还有 77 万条没读过"。
+            state["matching"] = db.count_matching(groups=groups, senders=senders)
+            state["unread"] = db.count_unread(
+                settings.resolved_mirror_path, groups=groups, senders=senders
+            )
+            state["scope"] = "whitelist" if (groups or senders) else "all"
         except SourceDatabaseError as exc:
             state["unread"] = None
             state["source"]["unread_error"] = str(exc)

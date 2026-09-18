@@ -125,7 +125,7 @@ def main() -> int:  # noqa: C901
     ):
         kwargs = {which.lower(): bad_value}
         try:
-            Settings(**kwargs).whitelist_fingerprint
+            Settings(**kwargs).validate_whitelist()
             check_true(f"{which}={bad_value!r} → 应该报错", False, "居然没报错")
         except ConfigError as exc:
             check_true(f"{which}={bad_value!r} → 报错", True, "")
@@ -133,46 +133,34 @@ def main() -> int:  # noqa: C901
             check_true(f"  报错给了正确格式的例子", "123456789" in str(exc), str(exc)[:110])
 
     # ------------------------------------------------------------------
-    print("\n--- 5. 指纹：号码集合决定一切，顺序与备注不影响 ---")
+    print("\n--- 5. 留空 / 顺序 / 备注：判定只看号码集合 ---")
     a = Settings(client_group_whitelist="123456789:甲,223456789:乙")
     b = Settings(client_group_whitelist="223456789,123456789")
-    c = Settings(client_group_whitelist="123456789,323456789")
-    check("顺序/备注不同 → 同一指纹（不该触发全量重看）", a.whitelist_fingerprint, b.whitelist_fingerprint)
-    check_true("号码变了 → 指纹变了", a.whitelist_fingerprint != c.whitelist_fingerprint)
-    check(
-        "发送者白名单也算进指纹",
-        Settings(client_sender_whitelist="10001").whitelist_fingerprint
-        != Settings(client_sender_whitelist="10002").whitelist_fingerprint,
-        True,
-    )
-    check("空白名单的指纹是稳定的", Settings().whitelist_fingerprint, Settings().whitelist_fingerprint)
+    check("顺序和备注不影响判定", a.allows("223456789", "1"), b.allows("223456789", "1"))
+    check("号码不同就不同", a.allows("323456789", "1"), False)
+    check("空白名单一律放行", Settings().allows("999999999", "1"), True)
+    # 解析出来的集合是我们下推给 SQL 的那一份：界面/日志里显示的和实际扫的必须一致
+    check("解析出来的群号集合", sorted(a.group_whitelist_map), ["123456789", "223456789"])
+    check("备注留下来了（只用于显示）", a.group_whitelist_map["123456789"], "甲")
 
     # ------------------------------------------------------------------
-    print("\n--- 6. 改白名单 → 之前被它跳过的消息要放回来 ---")
+    print("\n--- 6. 旧版本留下的「白名单跳过」记录会被清掉 ---")
+    # 白名单下推之后，"白名单外的消息"根本不会进镜像（扫都不扫），所以旧版本那批
+    # skipped 记录只是垃圾。清掉它们，那些消息的"读没读过"重新由白名单说话：
+    # 新放开的来源不在镜像里 → 下一轮自然被读到（不需要"放回待处理"那一步）。
     mirror = Mirror(SCRATCH / "wl-mirror.db")
-    # 一条被白名单跳过、一条因为别的原因跳过、一条正常完成
     mirror.claim(message("1"))
     mirror.finish("1", state=STATE_SKIPPED, error="whitelist:group 群 999999999 不在名单里")
     mirror.claim(message("2"))
-    mirror.finish("2", state=STATE_SKIPPED, error="不在订阅范围内")
+    mirror.finish("2", state=STATE_SKIPPED, error="闲聊")
     mirror.claim(message("3"))
     mirror.finish("3", state="done", raw_id="raw-3")
 
-    check("放回之前：whitelist 那条是 skipped", mirror.get("1").state, STATE_SKIPPED)
-    reopened = mirror.reopen_whitelist_skips()
-    check("放回了 1 条（只放 whitelist 那种）", reopened, 1)
-    check("被白名单挡的那条回到 pending", mirror.get("1").state, STATE_PENDING)
-    check("白名单的原因被清掉了", mirror.get("1").last_error, None)
-    check("因为别的原因跳过的**不动**（订阅外还是订阅外）", mirror.get("2").state, STATE_SKIPPED)
+    check("清掉 1 条（只有 whitelist 那种）", mirror.drop_whitelist_skips(), 1)
+    check("被白名单挡的那条从镜像里消失了", mirror.get("1"), None)
+    check("因为别的原因跳过的**不动**", mirror.get("2").state, STATE_SKIPPED)
     check("已经完成的也不动", mirror.get("3").state, "done")
-    check_true("它进了未完成队列，下一轮会被重看", any(r.msg_id == "1" for r in mirror.unfinished()))
-
-    print("\n--- 7. 白名单指纹存得下、读得回 ---")
-    check("一开始没有记录", mirror.get_meta("whitelist_fingerprint"), None)
-    mirror.set_meta("whitelist_fingerprint", a.whitelist_fingerprint)
-    check("写进去读得回来", mirror.get_meta("whitelist_fingerprint"), a.whitelist_fingerprint)
-    mirror.set_meta("whitelist_fingerprint", c.whitelist_fingerprint)
-    check("覆盖写也生效", mirror.get_meta("whitelist_fingerprint"), c.whitelist_fingerprint)
+    check("再清一次是 0 条（幂等）", mirror.drop_whitelist_skips(), 0)
 
     print()
     if fails:

@@ -215,6 +215,7 @@ function renderState(s) {
   $("banners").innerHTML = banners.join("");
 
   const unread = s.unread;
+  const scoped = s.scope === "whitelist";
   $("state").innerHTML = [
     kv("后端", be.reachable
       ? `<span class="ok">可达</span> · ${esc(be.qq || "")} (${esc(be.scope || "")})`
@@ -222,13 +223,17 @@ function renderState(s) {
     kv("源库", src.ok
       ? `${esc(src.rows ?? "?")} 行 · 最新 ${esc(fmtTs((src.latest_ts || 0) * 1000))}`
       : `<span class="bad">读不了</span>`),
-    kv("没读过的", unread == null ? "—" : `${unread} 条 <span class="dim">（一轮最多 ${c.max_per_cycle} 条）</span>`),
+    kv("白名单内", scoped
+      ? `${s.matching == null ? "—" : s.matching} 条 <span class="dim">（源库里只有这些会被读）</span>`
+      : `<span class="dim">没配白名单：源库里所有来源都读</span>`),
+    kv("没读过的", unread == null ? "—"
+      : `${unread} 条 <span class="dim">（${scoped ? "只算白名单内" : "全部"}；一轮最多 ${c.max_per_cycle} 条）</span>`),
     kv("镜像库", mir.error ? `<span class="bad">${esc(mir.error)}</span>`
       : `共 ${mir.total ?? 0} 条 · ${esc(JSON.stringify(mir.by_state || {}))}` +
         (mir.unfinished ? ` · <span class="warn">${mir.unfinished} 条没处理完</span>` : "")),
     kv("本地白名单", c.whitelist_active
       ? `群 ${(c.groups || []).length} 个 · 发送者 ${(c.senders || []).length} 个`
-      : `<span class="dim">没配：源库里所有来源都读</span>`),
+      : `<span class="dim">没配</span>`),
     kv("抽取器", esc(c.extractor || "") + (c.extractor === "rule" ? ` <span class="dim">（不花钱）</span>` : "")),
     kv("输入方式", c.pipeline ? `nt_msg.db → 自己解密导出` : `现成的导出库`),
     kv("运行中", run.busy

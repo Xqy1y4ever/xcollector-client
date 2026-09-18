@@ -1,4 +1,4 @@
-"""配置：**只有十几个**环境变量，其余参数写死在下面那一块常量里。
+﻿"""配置：**只有十几个**环境变量，其余参数写死在下面那一块常量里。
 
 **字段名 = 环境变量名的小写形式**（`CLIENT_DB_PATH` → `client_db_path`）。
 这不是随便定的：`pydantic-settings` 默认按字段名去找环境变量，名字对不上就会
@@ -23,8 +23,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import re
 from datetime import timedelta, timezone, tzinfo
@@ -182,25 +180,17 @@ class Settings(BaseSettings):
         """有没有配白名单。没配 = 不做这一层收窄。"""
         return bool(self.client_group_whitelist.strip() or self.client_sender_whitelist.strip())
 
-    @property
-    def whitelist_fingerprint(self) -> str:
-        """白名单的指纹（**顺带做形状校验** —— 号码写错会在这里就地抛 ConfigError）。
+    def validate_whitelist(self) -> None:
+        """解析白名单（**号码形状不对就地抛 ConfigError**）。
 
-        镜像库拿它判断"白名单改过了"。改过就要把之前**因为白名单被跳过**的消息
-        重新过一遍 —— 否则用户加上一个群之后会发现"什么都没发生"，而原因
-        （那些消息早就被记成 skipped 了）在界面上完全看不出来。
-
-        指纹取**解析并排序之后**的结果，而不是原始字符串：`a,b` 和 `b,a`、
-        或者备注改了但号码没改，都不算"白名单变了"，不该触发一次全量重看。
+        以前这里是个 `whitelist_fingerprint` 属性：镜像库拿指纹判断"白名单改过了"，
+        改过就把之前因它跳过的消息放回待处理。现在不需要了 —— 白名单**下推到了
+        SQL**（`SourceDatabase.whitelist_sql`），白名单外的消息根本不进镜像，
+        "新放开一个来源"下一轮自然会被读到。所以只剩"校验"这一件事，
+        名字也就跟着改成了它真正做的事。
         """
-        normalized = json.dumps(
-            {
-                "groups": sorted(self.group_whitelist_map),
-                "senders": sorted(self.sender_whitelist_map),
-            },
-            ensure_ascii=False,
-        )
-        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        self.group_whitelist_map      # 解析即校验
+        self.sender_whitelist_map
 
     def in_group_whitelist(self, group_id: str | int) -> bool:
         """留空 = 放行（见字段说明：这里是收窄，不是开关）。"""

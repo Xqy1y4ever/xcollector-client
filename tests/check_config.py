@@ -231,7 +231,7 @@ def main() -> int:  # noqa: C901
     )
     check(
         "号码写错 → 抛 ConfigError（拒绝启动）",
-        _raises_config_error(lambda: Settings(client_sender_whitelist="oops").whitelist_fingerprint),
+        _raises_config_error(lambda: Settings(client_sender_whitelist="oops").validate_whitelist()),
         True,
     )
 

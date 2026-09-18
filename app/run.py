@@ -85,7 +85,7 @@ class CycleReport:
     scanned: int = 0
     processed: int = 0
     skipped_whitelist: int = 0
-    reopened: int = 0
+    dropped_whitelist_rows: int = 0
     unchanged: int = 0
     recovered: int = 0
     outcomes: dict[str, int] = field(default_factory=dict)
@@ -208,6 +208,15 @@ async def _handle_one(
 ) -> Outcome:
     """处理一条消息（白名单 → 抽取 → 建通知），并把它记进镜像。
 
+    ## 白名单在这里只是**兜底**
+
+    扫描时白名单已经下推成 SQL 条件了（`SourceDatabase.iter_unread(groups=…,
+    senders=…)`），所以正常路径根本不会把白名单外的消息送到这里。这里再判一次是
+    为了两条边走得到的情况：
+
+      * 源库缺 `sender_qq` / `sender_uid` 列 → 发送者那一层推不进 SQL；
+      * 重试路径（`fetch_by_ids`，按 id 取）不带白名单条件。
+
     ## 这里**不看订阅**
 
     订阅是 **bot** 的东西（它的实时入库看的是订阅）；客户端读的是**自己账号**的
@@ -218,11 +227,12 @@ async def _handle_one(
     权限在后端那边是**按表**分的：客户端写的原文进 `user_raw_message`（按用户），
     bot 写的进共享的 `raw_message`。所以这里不需要、也不该自己判订阅。
     """
-    # ---- 白名单（本地收窄；留空 = 不限制）----
+    # ---- 白名单（兜底；扫描时已经下推过了）----
     if not settings.allows(message.group_id, message.sender_id):
         reason = settings.whitelist_reason(message.group_id, message.sender_id)
-        # 记成 skipped 并**带上 whitelist: 前缀**：前缀是标记，白名单一变就会被
-        # reopen_whitelist_skips() 放回来重看（否则改白名单等于没改）。
+        # 记成 skipped 并带上 `whitelist:` 前缀。新版本里这种情况几乎见不到（白名单
+        # 已下推），真出现时（源库缺发送者列 / 重试路径）也如实记下来；
+        # 这些行会在下一轮被 `drop_whitelist_skips()` 清掉。
         mirror.finish(message.msg_id, state=STATE_SKIPPED, error=reason)
         report.skipped_whitelist += 1
         return Outcome(result=OUTCOME_SKIPPED, reason=reason)
@@ -289,19 +299,20 @@ async def run_cycle(
     known_raw_ids = await load_processed_raw_ids(backend)
     report.mirror_before = store.stats()
 
-    # ---- 0) 白名单改过了？----
-    # 指纹与上次不同时，把当时"因为白名单被跳过"的消息放回待处理。
-    # 不做这一步的话，用户往白名单里加一个群会发现"什么都没发生" ——
-    # 那些消息早就被记成终态 skipped 了，而他在界面上看不到任何解释。
-    fingerprint = settings.whitelist_fingerprint  # 顺带校验号码形状（错了就地抛）
-    previous = store.get_meta("whitelist_fingerprint")
-    if previous is not None and previous != fingerprint:
-        reopened = store.reopen_whitelist_skips()
-        report.reopened = reopened
-        logger.warning(
-            "白名单变了，把之前因它跳过的 %d 条消息放回待处理（重新过一遍）", reopened
+    # ---- 0) 白名单校验 + 清掉旧版本留下的垃圾 ----
+    # 号码形状不对就**就地抛**（ConfigError），不要等到某一轮里出现一个看不懂的跳过。
+    settings.validate_whitelist()
+    # 白名单现在下推成 SQL 了：镜像里**不该**有白名单外的记录。旧版本是"逐条扫、
+    # 逐条记 skipped"，那些行留在镜像里纯属垃圾（一个真实例子里是 9,400 条，
+    # 而白名单内只有 109 条）。每次循环清一次，幂等。
+    dropped = store.drop_whitelist_skips()
+    report.dropped_whitelist_rows = dropped
+    if dropped:
+        logger.info(
+            "清掉 %d 条旧版本记下的「白名单跳过」记录 —— 白名单外现在的做法是"
+            "根本不扫、也不记（见 CLIENT_GROUP_WHITELIST 的说明）",
+            dropped,
         )
-    store.set_meta("whitelist_fingerprint", fingerprint)
 
     budget = MAX_MESSAGES_PER_CYCLE
     stats: dict[str, int] = {}
@@ -369,14 +380,24 @@ async def run_cycle(
     # 不管它多老。时间窗口表达不了"这条处理过没有"，会让"比任何窗口都老、而镜像里
     # 又没有"的消息（换过导出库、镜像被删过、白名单刚放开、导出曾经漏了一批）永远
     # 读不到 —— 而那正是这套系统最怕的"静默漏掉通知"。
-    unread_before = database.count_unread(store.path)
+    #
+    # 白名单**下推到 SQL**：配了白名单时，扫描根本不碰白名单外的消息，
+    # "没读过的"统计和镜像里记的也都只有白名单内那些。
+    groups = tuple(settings.group_whitelist_map)
+    senders = tuple(settings.sender_whitelist_map)
+    wl_note = database.whitelist_sql(groups, senders)[2]
+    if wl_note:
+        logger.warning("白名单有一层没法下推：%s", wl_note)
+
+    unread_before = database.count_unread(store.path, groups=groups, senders=senders)
     report.unread_before = unread_before
     if unread_before:
         logger.info(
-            "源库里还有 %s 条没读过的消息（本轮最多处理 %d 条）—— 判据是镜像里的"
+            "源库里还有 %s 条没读过的消息（本轮最多处理 %d 条）%s —— 判据是镜像里的"
             "已读标记，不看时间；处理完就记下，下一轮不再重复读。",
             f"{unread_before:,}",
             max(0, budget),
+            "（只算白名单内的）" if (groups or senders) else "",
         )
 
     latest = database.latest()
@@ -391,7 +412,9 @@ async def run_cycle(
             mirror_watermark,
         )
 
-    for message in database.iter_unread(store.path, limit=max(0, budget)):
+    for message in database.iter_unread(
+        store.path, limit=max(0, budget), groups=groups, senders=senders
+    ):
         await handle_one(message, recovered=False)
         budget -= 1
         if budget <= 0:

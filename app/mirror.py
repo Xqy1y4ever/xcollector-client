@@ -30,8 +30,12 @@
 
     pending  读到了、还没处理完（崩溃/重启后就是靠它恢复的）
     done     处理完成（= 你说的"已读"）
-    skipped  判定为不需要（白名单外、闲聊、源库缺字段）—— 也是终态，不再重试
+    skipped  判定为不需要（闲聊、源库缺字段）—— 也是终态，不再重试
     failed   处理失败，下轮重试
+
+**白名单外的消息不在这里**：白名单下推到 SQL 了（扫描根本不碰它们），所以
+"镜像 = 白名单内我处理过的那些"。镜像里只可能剩下旧版本留下的白名单记录，
+由 `drop_whitelist_skips()` 每次循环清一次。
 
 另外存了 `raw_id`：它让"这条消息对应后端哪条原文"能被查回来（重试、去重都要它）。
 其余字段都只是为了让人能看出来**为什么**。
@@ -74,16 +78,6 @@ CREATE TABLE IF NOT EXISTS message (
 CREATE INDEX IF NOT EXISTS ix_message_state_ts ON message(state, source_ts);
 CREATE INDEX IF NOT EXISTS ix_message_ts       ON message(source_ts);
 CREATE INDEX IF NOT EXISTS ix_message_group    ON message(group_id, source_ts);
-
--- 小配置快照。目前只存一件事：**白名单的指纹**。
---
--- 为什么要存：白名单改了之后，之前"因为它而被跳过"的消息必须重新过一遍。
--- 否则用户往白名单里加一个群，会发现"什么都没发生" —— 那些消息早就被记成
--- skipped 了，而这件事在界面上完全看不出来。这正是本项目最怕的那种静默失败。
-CREATE TABLE IF NOT EXISTS meta (
-  key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL DEFAULT ''
-);
 """
 
 
@@ -156,8 +150,8 @@ class Mirror:
         """把这条消息登记进镜像，返回登记后的那一行。
 
         **已经有了就原样返回**（不覆盖状态）：调用方只会在"这条我还没读过"时喊它，
-        所以这里就是一条 `INSERT OR IGNORE`。已经存在的行由 `unfinished()`（重试）
-        和 `reopen_whitelist_skips()`（白名单变了）负责改状态，不从这里走。
+        所以这里就是一条 `INSERT OR IGNORE`。已经存在的行由 `unfinished()` 负责
+        （重试没做完的），不从这里走。
 
         ⚠️ 登记成 `pending` 而不是 `done`：**先记账再干活**。反过来（干完才记账）
         的话，进程在"已经写进后端、还没记账"之间崩掉就只是重做一次（幂等挡住），
@@ -232,8 +226,8 @@ class Mirror:
         消息时，`MAX` 会给出更新的那条，`gap` 算出来是负的 → 不告警。否则每补一条
         历史消息就会凭空冒出一个"缺口"。
 
-        白名单跳过的**不算**"见过"：用户已经说了他不看那个来源，再为它的沉默
-        告警是噪音（`reopen_whitelist_skips()` 会把它们放回来，那时再算）。
+        白名单跳过的**不算**"见过"（新版本里这种记录根本不会产生，这里只是兼容
+        旧镜像里还剩着的那几条：用户说了不看那个来源，为它的沉默告警是噪音）。
         """
         with closing(self._connect()) as conn:
             row = conn.execute(
@@ -269,34 +263,24 @@ class Mirror:
         row = self.get(msg_id)
         return row.raw_id if row else None
 
-    # ---------------- 小配置快照 ----------------
+    def drop_whitelist_skips(self) -> int:
+        """删掉"因为白名单被跳过"的那些记录，返回删了几条。
 
-    def get_meta(self, key: str) -> str | None:
-        with closing(self._connect()) as conn:
-            row = conn.execute("SELECT value FROM meta WHERE key=?", (str(key),)).fetchone()
-        return str(row["value"]) if row else None
+        ## 为什么是**删**，而不是像以前那样"白名单变了就放回待处理"
 
-    def set_meta(self, key: str, value: str) -> None:
-        with closing(self._connect()) as conn:
-            conn.execute(
-                "INSERT INTO meta (key, value) VALUES (?,?)"
-                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (str(key), str(value)),
-            )
-            conn.commit()
+        白名单现在**下推到 SQL**（见 `app/source/ntmsg.py`）：扫描根本不碰白名单外的
+        消息，所以镜像里**不该**有它们的记录。于是"改了白名单要不要重看"这个问题
+        自己就没了 —— 新放开的来源本来就不在镜像里，下一轮自然会被读到。
 
-    def reopen_whitelist_skips(self) -> int:
-        """把"因为白名单被跳过"的消息重新放回待处理，返回放回了几条。
-
-        只在**白名单指纹变了**的时候调用（见 `app/run.py`）。这一步是"改白名单
-        之后立刻生效"的全部秘密：那些消息当时被记成终态 skipped，不放回来的话，
-        用户加完白名单只会看到什么都没发生。
+        这个方法只做一件事：把**旧版本**留下的那批记录清掉（那时是"逐条扫、逐条记
+        skipped"）。它们留在镜像里的坏处很具体：一个用户的真实库里这个数字是
+        9,400 条纯垃圾，而"白名单内共 109 条"才是他真正关心的。
+        每次循环调一次，幂等；删掉之后那些消息的"读没读过"重新由白名单说话。
         """
         with closing(self._connect()) as conn:
             cur = conn.execute(
-                "UPDATE message SET state=?, last_error=NULL, updated_at=?"
-                " WHERE state=? AND last_error LIKE 'whitelist:%'",
-                (STATE_PENDING, now_ms(), STATE_SKIPPED),
+                "DELETE FROM message WHERE state=? AND last_error LIKE 'whitelist:%'",
+                (STATE_SKIPPED,),
             )
             conn.commit()
             return int(cur.rowcount or 0)

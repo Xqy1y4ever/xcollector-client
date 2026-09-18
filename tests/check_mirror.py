@@ -118,19 +118,22 @@ def main() -> int:  # noqa: C901
     check("5 完成之后水位线跟到 9000", mirror.watermark(), 9000)
 
     # ------------------------------------------------------------------
-    print("\n--- 7. 白名单改了 → 把因它跳过的放回待处理 ---")
-    check("放回来了 1 条", mirror.reopen_whitelist_skips(), 1)
-    check("状态回到 pending", mirror.get("3").state, STATE_PENDING)
-    check("原因被清掉了（下次要重新判）", mirror.get("3").last_error, None)
-    check_true("它又进了未完成队列", any(r.msg_id == "3" for r in mirror.unfinished()))
-    check("再放一次是 0 条（幂等）", mirror.reopen_whitelist_skips(), 0)
+    print("\n--- 7. 旧版本留下的「白名单跳过」记录会被清掉 ---")
+    # 白名单现在下推成 SQL 了：白名单外的消息根本不进镜像。旧版本是"逐条扫、逐条
+    # 记 skipped"，那些行只会让镜像看起来有一堆东西（真实例子里 9,400 条垃圾）。
+    check("清掉 1 条", mirror.drop_whitelist_skips(), 1)
+    check("它就不在镜像里了", mirror.get("3"), None)
+    check("别再清第二次（幂等）", mirror.drop_whitelist_skips(), 0)
+    check("别的原因跳过的**不能**动", mirror.get("2").state, STATE_FAILED)
+    mirror.claim(msg("3"))          # 复原：后面还要用它统计
+    mirror.finish("3", state=STATE_SKIPPED, error="闲聊")
 
     # ------------------------------------------------------------------
     print("\n--- 8. 统计与批量查询 ---")
     stats = mirror.stats()
     check("总数对得上", stats["total"], 5)
     check_true("按状态分类里有 done", stats["by_state"].get("done", 0) >= 3, str(stats["by_state"]))
-    check_true("按状态分类里有 pending", stats["by_state"].get("pending", 0) >= 1, str(stats["by_state"]))
+    check_true("按状态分类里有 skipped", stats["by_state"].get("skipped", 0) >= 1, str(stats["by_state"]))
     many = mirror.get_many(["1", "2", "nope"])
     check("批量查只返回存在的", sorted(many), ["1", "2"])
     check("批量查空列表返回空", mirror.get_many([]), {})

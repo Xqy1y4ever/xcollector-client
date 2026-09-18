@@ -413,9 +413,10 @@ class SourceDatabase:
     # 没有的消息（换了导出库、镜像被删过、白名单刚放开、导出曾经漏了一批）永远不会
     # 被读到 —— 而"该看到的没看到"正是这套系统最怕的失败。
     #
-    # 代价说清楚：没有任何过滤时，第一次运行会把导出库里**所有**群消息过一遍
-    # （几十万条）。这是刻意的：它们会被逐条标记（白名单外的记 skipped，很便宜），
-    # 一轮之后就不再重复读。想少读一点，用 CLIENT_GROUP_WHITELIST / CLIENT_SENDER_WHITELIST。
+    # 白名单（`groups` / `senders`）**下推到 SQL**：扫描、未读统计、镜像里记的东西
+    # 都只涉及白名单内的消息。以前是在 Python 里逐条判 —— 于是配了白名单也没用：
+    # "没读过的"是整个库（77 万条），每轮还要把白名单外的几十万条挨个写进镜像
+    # （记成 skipped）。现在配了白名单就真的只剩那几条。
 
     def _attach_mirror(self, conn: sqlite3.Connection, mirror_path: Path | str) -> None:
         """把镜像库（只读）挂进源库连接，用来做"没读过"的反连接。
@@ -437,6 +438,47 @@ class SourceDatabase:
             "ATTACH DATABASE " + quote_sql(sqlite_uri(mirror, "ro")) + " AS xc_mirror"
         )
 
+    def whitelist_sql(self, groups: Sequence[str], senders: Sequence[str]) -> tuple[str, list, str]:
+        """把白名单翻成 SQL 条件。返回 `(where, params, 说明)`。
+
+        `说明` 是给日志/自检用的：哪一部分**没法**下推（源库缺列时），
+        那种情况下这一层仍然只能在 Python 里判 —— 要能看出来，否则用户会以为
+        "配了白名单就只扫这几条"，而实际上没有。
+        """
+        if not self._columns:
+            with closing(self._connect()) as conn:
+                self._columns = _column_names(conn, self._table)
+        clauses: list[str] = []
+        params: list = []
+        notes: list[str] = []
+
+        if groups:
+            clauses.append(
+                "CAST(t.group_id AS TEXT) IN (" + ",".join("?" * len(groups)) + ")"
+            )
+            params.extend(str(g) for g in groups)
+
+        if senders:
+            # `SourceMessage.sender_id` 是"先 sender_qq、后退 sender_uid"，
+            # 所以两边都要认 —— 只按 sender_qq 过滤会漏掉只有 uid 的那些行。
+            columns = [c for c in ("sender_qq", "sender_uid") if c in self._columns]
+            if columns:
+                parts = [
+                    f'CAST(t."{c}" AS TEXT) IN (' + ",".join("?" * len(senders)) + ")"
+                    for c in columns
+                ]
+                clauses.append("(" + " OR ".join(parts) + ")")
+                for _ in columns:
+                    params.extend(str(s) for s in senders)
+            else:
+                notes.append(
+                    "源表没有 sender_qq / sender_uid 列，发送者白名单**没法**在 SQL 里过滤"
+                    "（仍在 Python 里判）"
+                )
+
+        where = " AND ".join(clauses)
+        return where, params, "；".join(notes)
+
     def _unread_where(self) -> str:
         # `CAST(... AS TEXT)`：镜像里的 msg_id 是 TEXT，而导出表的 msg_id 在
         # nt_msg_db_util 的表结构里是 INTEGER 主键 —— SQLite 比较 INTEGER 与 TEXT
@@ -452,16 +494,25 @@ class SourceDatabase:
         *,
         limit: int,
         cursor: tuple[int, str] | None = None,
+        groups: Sequence[str] = (),
+        senders: Sequence[str] = (),
     ) -> list[SourceMessage]:
         """取**镜像里没有**的消息，按时间**正序**（从最老的未读开始）。
 
         翻页用 `cursor`（上一条的 `(timestamp, msg_id)`）而不是靠"处理时会把镜像写
         进去"：那样一来"这一批取多少"就和"写没写镜像"绑在一起了，读取器的行为会
         依赖调用方的副作用（曾经因为 `--dry-run` 不写镜像而在这里死循环过）。
+
+        `groups` / `senders` 是白名单，**直接下推成 SQL 条件**：配了白名单时，
+        扫描根本不碰白名单外的消息（于是也不会把它们写进镜像）。
         """
         mirror = Path(mirror_path)
         where = self._unread_where()
         params: list = []
+        wl_where, wl_params, _ = self.whitelist_sql(groups, senders)
+        if wl_where:
+            where = f"({where}) AND ({wl_where})"
+            params.extend(wl_params)
         if cursor is not None:
             ts, msg_id = int(cursor[0]), str(cursor[1])
             where += " AND (t.timestamp > ? OR (t.timestamp = ? AND t.msg_id > ?))"
@@ -493,9 +544,25 @@ class SourceDatabase:
                 ) from exc
         return [self._to_message(row) for row in rows]
 
-    def count_unread(self, mirror_path: Path | str) -> int:
-        """还有多少条没读过（给日志与 `--status` 用；**不是**用来限制读取的）。"""
+    def count_unread(
+        self,
+        mirror_path: Path | str,
+        *,
+        groups: Sequence[str] = (),
+        senders: Sequence[str] = (),
+    ) -> int:
+        """还有多少条没读过（给日志与 `--status` 用；**不是**用来限制读取的）。
+
+        `groups` / `senders` 与扫描用的是**同一个** SQL 条件 —— 否则界面上会说
+        "还有 77 万条没读过"，而实际只扫白名单内的那几条（这正是它以前的样子）。
+        """
         mirror = Path(mirror_path)
+        where = self._unread_where()
+        params: list = []
+        wl_where, wl_params, _ = self.whitelist_sql(groups, senders)
+        if wl_where:
+            where = f"({where}) AND ({wl_where})"
+            params.extend(wl_params)
         with closing(self._connect()) as conn:
             if not self._columns:
                 self._columns = _column_names(conn, self._table)
@@ -503,10 +570,36 @@ class SourceDatabase:
             try:
                 row = conn.execute(
                     f'SELECT COUNT(*) AS n FROM "{self._table}" AS t'
-                    f" WHERE {self._unread_where()}"
+                    f" WHERE {where}",
+                    tuple(params),
                 ).fetchone()
             except sqlite3.Error as exc:
                 raise SourceDatabaseError(f"统计未读失败（{self.path.name}）：{exc}") from exc
+        return int(row["n"] if row else 0)
+
+    def count_matching(
+        self,
+        *,
+        groups: Sequence[str] = (),
+        senders: Sequence[str] = (),
+    ) -> int:
+        """源库里**匹配白名单**的行数（不看镜像）。
+
+        用途：回答"筛选之后到底有多少条" —— 界面上要能同时看到
+        "白名单内共 N 条"和"没读过的 M 条"，否则配了白名单的人会以为
+        "没读过"那一堆是整个库（以前确实是这样，因为过滤是在 Python 里做的）。
+        """
+        where, params, _ = self.whitelist_sql(groups, senders)
+        with closing(self._connect()) as conn:
+            if not self._columns:
+                self._columns = _column_names(conn, self._table)
+            sql = f'SELECT COUNT(*) AS n FROM "{self._table}" AS t'
+            if where:
+                sql += f" WHERE {where}"
+            try:
+                row = conn.execute(sql, tuple(params)).fetchone()
+            except sqlite3.Error as exc:
+                raise SourceDatabaseError(f"统计白名单内行数失败（{self.path.name}）：{exc}") from exc
         return int(row["n"] if row else 0)
 
     def iter_unread(
@@ -515,6 +608,8 @@ class SourceDatabase:
         *,
         limit: int,
         chunk: int = 500,
+        groups: Sequence[str] = (),
+        senders: Sequence[str] = (),
     ) -> Iterator[SourceMessage]:
         """分块迭代"没读过的"消息，直到取满 `limit` 或没有更多。
 
@@ -526,7 +621,9 @@ class SourceDatabase:
         cursor: tuple[int, str] | None = None
         while taken < limit:
             want = min(chunk, limit - taken)
-            batch = self.fetch_unread(mirror_path, limit=want, cursor=cursor)
+            batch = self.fetch_unread(
+                mirror_path, limit=want, cursor=cursor, groups=groups, senders=senders
+            )
             if not batch:
                 return
             for message in batch:

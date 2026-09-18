@@ -389,16 +389,14 @@ async def run_all() -> int:  # noqa: C901
             ])
             count_before = len(notifications(token))
             report = await run_cycle(backend9, settings9, db=SourceDatabase(db_wl), mirror=mirror9)
-            check("被白名单挡下", report.skipped_whitelist, 1)
+            # 白名单**下推到 SQL**：白名单外的消息根本不会被扫到，也就不会进镜像 ——
+            # 于是"没读过的"只算白名单内的（这正是"筛选之后应该只有几条"）。
+            check("白名单外的消息：一条都不算没读过", report.unread_before, 0)
+            check("也没扫它", report.scanned, 0)
             check("一条通知都没建", len(notifications(token)), count_before)
-            check("镜像里是 skipped（终态）", mirror9.get("600").state, STATE_SKIPPED)
-            check_true(
-                "原因带 whitelist: 前缀（改白名单时就是靠它认出来的）",
-                str(mirror9.get("600").last_error).startswith("whitelist:"),
-                str(mirror9.get("600").last_error),
-            )
+            check("镜像里没有它（白名单外的不记）", mirror9.get("600"), None)
 
-            # 白名单改成放行这个群 → 之前被挡的那条要**立刻**被重看
+            # 白名单改成放行这个群 → 它变成"白名单内且没读过"，下一轮自然被读到
             settings10 = make_settings(
                 token, db_wl, client_mirror_path=str(mirror9_path),
                 client_group_whitelist=GROUP,
@@ -408,16 +406,15 @@ async def run_all() -> int:  # noqa: C901
                 report = await run_cycle(
                     backend10, settings10, db=SourceDatabase(db_wl), mirror=mirror9
                 )
-                check("白名单改过 → 把之前跳过的那条放回来", report.reopened, 1)
+                check("改白名单后它就成了没读过的", report.unread_before, 1)
                 check("于是它真的入库了", report.outcomes.get("extracted"), 1)
-                check("镜像里变成 done", mirror9.get("600").state, STATE_DONE)
+                check("镜像里是 done", mirror9.get("600").state, STATE_DONE)
                 check("通知数 +1", len(notifications(token)), count_before + 1)
 
-                # 指纹没变 → 不再放回（否则每轮都要重看一遍被跳过的消息）
                 report = await run_cycle(
                     backend10, settings10, db=SourceDatabase(db_wl), mirror=mirror9
                 )
-                check("指纹没变就不放回", report.reopened, 0)
+                check("下一轮没有没读过的了", report.unread_before, 0)
                 check("也没重抽（镜像说读过了）", report.processed, 0)
             finally:
                 await backend10.close()

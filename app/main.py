@@ -139,16 +139,26 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
     print(f"  共 {stats['total']} 条，状态 {stats['by_state'] or {}}")
     print(f"  水位线（已处理完的最大时间戳）：{mirror.watermark() or '（还没有）'}")
     # 读什么由**这个**决定，不由时间决定：源库里没被标记过的都要读，不管多老。
+    # 白名单**下推到 SQL**：配了白名单时，这个数只算白名单内的消息
+    # （以前它是整个库的行数，看起来像"要读 77 万条"）。
+    groups = tuple(settings.group_whitelist_map)
+    senders = tuple(settings.sender_whitelist_map)
     try:
-        unread = db.count_unread(settings.resolved_mirror_path)
+        unread = db.count_unread(settings.resolved_mirror_path, groups=groups, senders=senders)
+        scope = "（只算白名单内的）" if (groups or senders) else "（没配白名单：源库里所有的都要读）"
         print(
-            f"  没读过的消息    {unread} 条"
+            f"  没读过的消息    {unread} 条" + scope
             + (
-                "（下一轮接着读；一轮最多读 CLIENT_MAX_MESSAGES_PER_CYCLE 条）"
+                f"；一轮最多读 {MAX_MESSAGES_PER_CYCLE} 条"
                 if unread
-                else "（都读过了，下一轮只读新增的）"
+                else "；下一轮只读新增的"
             )
         )
+        if groups or senders:
+            print(
+                f"                  白名单内共 {db.count_matching(groups=groups, senders=senders)} 条"
+                f"（源库共 {info['rows']} 行）"
+            )
     except SourceDatabaseError as exc:
         print(f"  没读过的消息    算不出来：{exc}")
     unfinished = mirror.unfinished()
@@ -262,7 +272,7 @@ async def amain(args: argparse.Namespace) -> int:
     # 白名单里写错一个号码的后果是"那个来源永远不进清单"，而它在日志里只是一个
     # "跳过"。越早炸越好，最好是在发出任何请求之前。
     try:
-        settings.whitelist_fingerprint  # 解析即校验（号码形状不对会抛）
+        settings.validate_whitelist()  # 号码形状不对会抛 ConfigError
     except ConfigError as exc:
         logger.error("配置有问题：%s", exc)
         return 2

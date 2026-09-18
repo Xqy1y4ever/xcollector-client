@@ -190,6 +190,44 @@ def main() -> int:  # noqa: C901
         # 1002 留成未读，游标必须仍然把 1002 带出来。
         check("同一秒里剩下的那条没被跳过", [m.msg_id for m in db.iter_unread(mirror_db, limit=10)][-3:], ["1003", "1004", "1005"])
 
+        # ------------------------------------------------------------------
+        print("\n--- 4b. 白名单**下推到 SQL**（配了就只扫这些）---")
+        # 夹具：1001/1002 在群 123456789（发送者 10001），1003 也在 123456789（10002），
+        # 1004/1005 在群 987654321（10003）。
+        check("群白名单只算这个群", db.count_matching(groups=["123456789"]), 3)
+        check("群 + 发送者（AND）", db.count_matching(groups=["123456789"], senders=["10002"]), 1)
+        check("只按发送者", db.count_matching(senders=["10003"]), 2)
+        check("都不配 = 整个库", db.count_matching(), 5)
+        check("配了不存在的群 → 0 条", db.count_matching(groups=["1"]), 0)
+
+        # 未读统计必须用**同一套**条件：配了白名单还报"全库 5 条没读过"就是坑
+        # （界面上看起来像要读 77 万条，实际只扫白名单内那几条）。
+        check(
+            "没读过：只算白名单内的",
+            db.count_unread(mirror_db, groups=["123456789"]),
+            1,   # 1003；1001/1002 刚刚已经标成 done
+        )
+        check(
+            "扫描也只返回白名单内的",
+            [m.msg_id for m in db.iter_unread(mirror_db, limit=10, groups=["123456789"])],
+            ["1003"],
+        )
+        check(
+            "发送者白名单同样生效",
+            [m.msg_id for m in db.iter_unread(mirror_db, limit=10, senders=["10003"])],
+            ["1004", "1005"],
+        )
+        check(
+            "两个都配 = 同时满足",
+            [m.msg_id for m in db.iter_unread(mirror_db, limit=10, groups=["123456789"], senders=["10001"])],
+            [],   # 1001/1002 已读，1003 的发送者是 10002
+        )
+        # 白名单 + 游标分页一起用：翻页不能把白名单外的带进来
+        paged_wl = [m.msg_id for m in db.iter_unread(mirror_db, limit=10, chunk=1, senders=["10003"])]
+        check("白名单 + 分页一起用也对", paged_wl, ["1004", "1005"])
+        check("whitelist_sql 说明了没法下推的部分（这里有列，所以是空的）",
+              db.whitelist_sql(["123456789"], ["10001"])[2], "")
+
         # msg_id 类型：镜像里是 TEXT，导出表里可能是 INTEGER —— 不转类型的话
         # 反连接会"全部命中"，等于每次把整个库读一遍。
         int_ids = tmp_path / "int_ids.db"
@@ -278,6 +316,25 @@ def main() -> int:  # noqa: C901
         check("正文降级成空串（不编内容）", got_lean.text, "")
         check("附件降级成空列表", got_lean.attachments, [])
         check("群号和发送者还在", (got_lean.group_id, got_lean.sender_id), ("123456789", "10001"))
+        # 白名单里"发送者"那一层推不进 SQL（源表连发送者列都没有）→ 必须**说出来**，
+        # 而不是安静地按"没有发送者限制"扫。
+        note = db_lean.whitelist_sql([], ["10001"])[2]
+        check("缺发送者列时照样能推（这个库有 sender_qq）", note, "")
+        check("群白名单也能推", db_lean.whitelist_sql(["123456789"], [])[0],
+              "CAST(t.group_id AS TEXT) IN (?)")
+        no_sender = tmp_path / "no_sender.db"
+        conn = sqlite3.connect(no_sender)
+        conn.executescript(
+            "CREATE TABLE group_messages (msg_id TEXT PRIMARY KEY, timestamp INTEGER,"
+            " group_id TEXT);"
+        )
+        conn.execute("INSERT INTO group_messages VALUES ('1', 1757692800, '123456789')")
+        conn.commit()
+        conn.close()
+        db_ns = SourceDatabase(no_sender)
+        ns_where, _, ns_note = db_ns.whitelist_sql([], ["10001"])
+        check_true("连发送者列都没有时 → 明说没法下推", "没法" in ns_note, ns_note)
+        check("推不进去就不假装推了（where 为空，交给 Python 兜底）", ns_where, "")
 
         # ------------------------------------------------------------------
         print("\n--- 8. 拿错库 / 文件不在：报错要能指导下一步 ---")
