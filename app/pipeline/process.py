@@ -45,6 +45,7 @@ from ..source.attachments import AttachmentResolver, ResolvedAttachment
 from ..source.ntmsg import SourceMessage
 from ..utils import local_day, now_ms, preview
 from .extract import (
+    fill_due_from_rule,
     finalize,
     merge_rule_disagreement,
     run_llm,
@@ -210,6 +211,9 @@ async def extract(message: SourceMessage, settings: Settings) -> tuple[dict | No
             logger.warning("交叉验证失败（只用主模型的结果）msg_id=%s：%s", message.msg_id, exc)
 
     merged = merge_rule_disagreement(llm_result, rule_result, settings.llm_model)
+    # 模型"是通知但没算出时间"时，用确定性的规则引擎补 due_at（「下周三」「这周天」
+    # 这类相对时间靠日期运算，模型经常算不出来，而 parse_due 不会算错）。
+    merged = fill_due_from_rule(merged, rule_result, source_ts=message.ts_ms)
     if merged is not None and merged.get("tokens") is None:
         merged["tokens"] = tokens
     return merged, False, tokens

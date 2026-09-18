@@ -83,8 +83,13 @@ async def acompletion(
         payload["response_format"] = {"type": "json_object"}
 
     url = _endpoint(api_base)
+    # **本机端点不走系统代理**：httpx 默认 `trust_env=True`，会读 Windows 注册表里的
+    # 系统代理（装过 Clash/V2Ray 的机器上常留着一条 `127.0.0.1:7890`）。那个代理没开着
+    # 时，连本机自己起的模型服务（ollama / one-api 之类）都会连不上。公网厂商照旧走代理
+    # —— 很多人正是靠代理才能访问 OpenAI/Google。
+    local = (httpx.URL(url).host or "").lower() in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=not local) as client:
             resp = await client.post(
                 url,
                 json=payload,

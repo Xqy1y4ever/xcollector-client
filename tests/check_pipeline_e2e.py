@@ -139,12 +139,15 @@ def text_of(text: str) -> dict:
 
 
 def sync(token: str, path: str, method: str = "GET", **kwargs) -> httpx.Response:
-    with httpx.Client(base_url=BASE, timeout=20, headers={"Authorization": f"Bearer {token}"}) as c:
+    with httpx.Client(
+        base_url=BASE, timeout=20, headers={"Authorization": f"Bearer {token}"},
+        trust_env=False,   # 本机后端不走系统代理（见 tests/check_webui.py 的说明）
+    ) as c:
         return c.request(method, path, **kwargs)
 
 
 def register_user() -> tuple[str, str]:
-    c = httpx.Client(timeout=20)
+    c = httpx.Client(timeout=20, trust_env=False)
     try:
         code = c.post(f"{API}/verify/request", json={"qq": QQ}, headers=H).json()["code"]
         invite = c.post(

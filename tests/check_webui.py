@@ -157,7 +157,9 @@ def main() -> int:  # noqa: C901
     base = f"http://127.0.0.1:{port}"
     ui_headers = {"X-XC-UI": "1", "Content-Type": "application/json"}
     try:
-        with httpx.Client(timeout=20) as c:
+        # trust_env=False：**别让测试走这台机器的系统代理**（Windows 注册表里那条 Clash/V2Ray
+        # 代理没开着的时候，连 127.0.0.1 都会被发过去然后连接被拒）。
+        with httpx.Client(timeout=20, trust_env=False) as c:
             r = c.get(f"{base}/")
             check("页面拿得到", r.status_code, 200)
             check_true("是 HTML", "text/html" in r.headers.get("content-type", ""), r.headers.get("content-type"))
