@@ -39,3 +39,9 @@ jobs:
 
       - name: 镜像库状态机（增量与"内容变了"的判据）
         run: python -m tests.check_mirror
+
+      - name: 白名单（只收窄、号码校验、改了立刻生效）
+        run: python -m tests.check_whitelist
+
+      - name: 配置三方对账（字段 ↔ 环境变量 ↔ 代码）
+        run: python -m tests.check_config

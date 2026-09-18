@@ -18,6 +18,33 @@ RUN useradd --create-home --uid 10001 client
 
 WORKDIR /app
 
+# ---------------------------------------------------------------------------
+# 构建期默认值（可选）
+#
+# 这三项可以在这里定成镜像的默认值，方便把一个**预配好**的客户端发给别人：
+#
+#   docker build \
+#     --build-arg BACKEND_BASE_URL=https://collector.example.com \
+#     --build-arg CLIENT_GROUP_WHITELIST=123456789:官方通知群 \
+#     --build-arg CLIENT_SENDER_WHITELIST=10001:张老师 \
+#     -t xcollector-client .
+#
+# ⚠️ 说清代价：
+#   1. 定进去的值**改不了，除非重新构建**。所以它们是"默认值"，
+#      运行时用环境变量/--env-file 仍然可以覆盖（ENV 只是默认，docker run -e 优先）；
+#   2. **绝不要**把 CLIENT_TOKEN 做成 build-arg。构建参数会留在镜像层里，
+#      任何拿到镜像的人都能 `docker history` 看到它 —— 那是这个用户的全部凭据。
+#      令牌请走运行时环境变量。
+# ---------------------------------------------------------------------------
+ARG BACKEND_BASE_URL=http://127.0.0.1:8000
+ARG CLIENT_GROUP_WHITELIST=
+ARG CLIENT_SENDER_WHITELIST=
+
+ENV BACKEND_BASE_URL=${BACKEND_BASE_URL} \
+    CLIENT_GROUP_WHITELIST=${CLIENT_GROUP_WHITELIST} \
+    CLIENT_SENDER_WHITELIST=${CLIENT_SENDER_WHITELIST}
+# 白名单里没配的项在运行时用 `-e CLIENT_GROUP_WHITELIST=...` 覆盖即可。
+
 # 先装依赖，利用层缓存
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt

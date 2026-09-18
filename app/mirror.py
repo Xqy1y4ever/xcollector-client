@@ -85,6 +85,16 @@ CREATE TABLE IF NOT EXISTS amendment (
   target_msg_id TEXT NOT NULL,
   created_at    INTEGER NOT NULL DEFAULT 0
 );
+
+-- 小配置快照。目前只存一件事：**白名单的指纹**。
+--
+-- 为什么要存：白名单改了之后，之前"因为它而被跳过"的消息必须重新过一遍。
+-- 否则用户往白名单里加一个群，会发现"什么都没发生" —— 那些消息早就被记成
+-- skipped 了，而这件事在界面上完全看不出来。这正是本项目最怕的那种静默失败。
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -323,3 +333,35 @@ class Mirror:
     def raw_id_of(self, msg_id: str) -> str | None:
         row = self.get(msg_id)
         return row.raw_id if row else None
+
+    # ---------------- 小配置快照 ----------------
+
+    def get_meta(self, key: str) -> str | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key=?", (str(key),)).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?,?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(key), str(value)),
+            )
+            conn.commit()
+
+    def reopen_whitelist_skips(self) -> int:
+        """把"因为白名单被跳过"的消息重新放回待处理，返回放回了几条。
+
+        只在**白名单指纹变了**的时候调用（见 `app/run.py`）。这一步是"改白名单
+        之后立刻生效"的全部秘密：那些消息当时被记成终态 skipped，不放回来的话，
+        用户加完白名单只会看到什么都没发生。
+        """
+        with closing(self._connect()) as conn:
+            cur = conn.execute(
+                "UPDATE message SET state=?, last_error=NULL, updated_at=?"
+                " WHERE state=? AND last_error LIKE 'whitelist:%'",
+                (STATE_PENDING, now_ms(), STATE_SKIPPED),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)

@@ -20,7 +20,7 @@ import logging
 import sys
 
 from .backend_client import BackendClient, BackendError
-from .config import get_settings
+from .config import ConfigError, get_settings
 from .logging_setup import setup_logging
 from .run import (
     load_processed_raw_ids,
@@ -62,6 +62,10 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
     print(f"  源库            {settings.resolved_db_path}")
     print(f"  镜像库          {settings.resolved_mirror_path}")
     print(f"  附件根目录      {settings.resolved_attachment_root or '（未配置，附件只能留远程地址）'}")
+    group_wl = settings.client_group_whitelist.strip() or "（不限制）"
+    sender_wl = settings.client_sender_whitelist.strip() or "（不限制）"
+    print(f"  白名单（只收窄）群={group_wl}")
+    print(f"                  发送者={sender_wl}")
     print(f"  抽取器          {settings.client_extractor}")
     print(f"  轮询间隔        {settings.client_poll_seconds}s")
     print(f"  回看窗口        {settings.client_recheck_overlap_hours}h（识别内容改动的范围）")
@@ -179,6 +183,15 @@ async def amain(args: argparse.Namespace) -> int:
         )
         return 2
 
+    # **在读源库、连后端之前**就把配置校验掉。放在这里而不是等到循环里：
+    # 白名单里写错一个号码的后果是"那个来源永远不进清单"，而它在日志里只是一个
+    # "跳过"。越早炸越好，最好是在发出任何请求之前。
+    try:
+        settings.whitelist_fingerprint  # 解析即校验（号码形状不对会抛）
+    except ConfigError as exc:
+        logger.error("配置有问题：%s", exc)
+        return 2
+
     db = SourceDatabase(settings.resolved_db_path)
     backend = BackendClient(settings)
     try:
@@ -189,6 +202,10 @@ async def amain(args: argparse.Namespace) -> int:
             await run_loop(backend, settings)
             return 0
         return await run_once(backend, settings, since_hours=args.since_hours)
+    except ConfigError as exc:
+        # 配置错误**不进重试、也不降级**：它只会让某些来源安静地不入库
+        logger.error("配置有问题：%s", exc)
+        return 2
     except BackendError as exc:
         logger.error("后端调用失败：%s", exc)
         return 1

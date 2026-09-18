@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import timedelta, timezone, tzinfo
 from functools import lru_cache
 from pathlib import Path
@@ -23,6 +24,56 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # 时区警告只打一次（见 Settings.tz 的说明）
 _warned_tz = False
+
+
+class ConfigError(RuntimeError):
+    """配置本身有问题 —— 这类错误**宁可让进程起不来**，也不能降级跑。
+
+    因为降级的后果全都是"安静地不入库"：白名单里写错一个字符 → 那个来源永远不进
+    清单，而日志里只会看到"跳过"，看不到"你配错了"。
+    """
+
+
+def parse_id_name_pairs(raw: str) -> dict[str, str]:
+    """解析 `id:备注,id:备注` 形式的配置，返回 `{id: 备注}`。
+
+    格式和 `xcollector-bot` **完全一样**（备注可省略；冒号兼容全角「：」，
+    逗号兼容「，」），这样运维可以直接把 bot 里那份复制过来。
+    """
+    out: dict[str, str] = {}
+    for chunk in (raw or "").replace("，", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        id_part, name = chunk, ""
+        for sep in (":", "："):
+            if sep in chunk:
+                id_part, name = chunk.split(sep, 1)
+                break
+        id_part = id_part.strip()
+        if not id_part:
+            continue
+        out[id_part] = name.strip() or id_part
+    return out
+
+
+# QQ 号 / 群号的形状（与 backend 的 app_user.qq 校验同一套：5~12 位、不以 0 开头）。
+_ID_SHAPE = re.compile(r"^[1-9]\d{4,11}$")
+
+
+def _validate_ids(mapping: dict[str, str], *, field: str) -> None:
+    """白名单里的号码形状不对就**直接拒绝启动**。
+
+    这一条是刻意的：写错一个字符的后果是"那个来源永远不进清单"，而它在日志里
+    只是一个"跳过" —— 属于最难发现的那类故障。宁可起不来。
+    """
+    bad = sorted(k for k in mapping if not _ID_SHAPE.match(k))
+    if bad:
+        raise ConfigError(
+            f"{field} 里有不像 QQ 号 / 群号的条目：{bad}。"
+            "格式是「号码」或「号码:备注」，多个用逗号分隔"
+            "（例：123456789:通知群,987654321:教务处）。"
+        )
 
 
 class Settings(BaseSettings):
@@ -90,6 +141,29 @@ class Settings(BaseSettings):
     # 后端有旧内容的任务，捷径一开就永远不更新。强制模式关掉捷径，按内容重抽一遍。
     client_force_recheck: bool = False
 
+    # ---------------- 白名单（**只做收窄，不是开关**） ----------------
+    # 格式与 bot 完全相同（`号码:备注,号码:备注`，备注可省），可以直接复制过来：
+    #
+    #   CLIENT_GROUP_WHITELIST=123456789:官方通知群,987654321
+    #   CLIENT_SENDER_WHITELIST=10001:张老师,10002
+    #
+    # ⚠️ **语义与 bot 相反，这一点必须看清楚**：
+    #
+    #   bot      ：留空 = 谁都不放行（fail-closed）。它是唯一入库方，空名单意味着
+    #              "还没配好"，所以关死。
+    #   client   ：留空 = **不额外限制**。客户端的过滤条件是**你在后端配的订阅**，
+    #              白名单只是在这个基础上再收窄一层（源库里往往有几百个群，
+    #              先按群/发送者砍一刀能省很多无用扫描）。
+    #
+    # 为什么不做成 fail-closed：照抄 bot 的话，一个已经跑通的客户端在升级后
+    # 会因为"白名单还是空的"而**静默停止入库** —— 而它本来工作得好好的。
+    # 默认值不该让工作正常的部署失效。
+    #
+    # 两个都是"同时满足"（AND）：群在群里白名单 **且** 发送者在发送者白名单。
+    # 号码形状不对会**拒绝启动**（见 `_validate_ids`）。
+    client_group_whitelist: str = ""
+    client_sender_whitelist: str = ""
+
     # ---------------- 抽取 ----------------
     client_extractor: Literal["rule", "llm", "both"] = "rule"
     llm_api_base: str = "https://api.deepseek.com/v1"
@@ -134,6 +208,73 @@ class Settings(BaseSettings):
     @property
     def backend_base(self) -> str:
         return self.backend_base_url.rstrip("/")
+
+    # ---------------- 白名单 ----------------
+
+    @property
+    def group_whitelist_map(self) -> dict[str, str]:
+        mapping = parse_id_name_pairs(self.client_group_whitelist)
+        _validate_ids(mapping, field="CLIENT_GROUP_WHITELIST")
+        return mapping
+
+    @property
+    def sender_whitelist_map(self) -> dict[str, str]:
+        mapping = parse_id_name_pairs(self.client_sender_whitelist)
+        _validate_ids(mapping, field="CLIENT_SENDER_WHITELIST")
+        return mapping
+
+    @property
+    def whitelist_active(self) -> bool:
+        """有没有配白名单。没配 = 不做这一层收窄。"""
+        return bool(self.client_group_whitelist.strip() or self.client_sender_whitelist.strip())
+
+    @property
+    def whitelist_fingerprint(self) -> str:
+        """白名单的指纹（**顺带做形状校验** —— 号码写错会在这里就地抛 ConfigError）。
+
+        镜像库拿它判断"白名单改过了"。改过就要把之前**因为白名单被跳过**的消息
+        重新过一遍 —— 否则用户加上一个群之后会发现"什么都没发生"，而原因
+        （那些消息早就被记成 skipped 了）在界面上完全看不出来。
+
+        指纹取**解析并排序之后**的结果，而不是原始字符串：`a,b` 和 `b,a`、
+        或者备注改了但号码没改，都不算"白名单变了"，不该触发一次全量重看。
+        """
+        import hashlib
+        import json
+
+        normalized = json.dumps(
+            {
+                "groups": sorted(self.group_whitelist_map),
+                "senders": sorted(self.sender_whitelist_map),
+            },
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+    def in_group_whitelist(self, group_id: str | int) -> bool:
+        """留空 = 放行（见字段说明：这里是收窄，不是开关）。"""
+        mapping = self.group_whitelist_map
+        if not mapping:
+            return True
+        return str(group_id) in mapping
+
+    def in_sender_whitelist(self, sender_id: str | int) -> bool:
+        mapping = self.sender_whitelist_map
+        if not mapping:
+            return True
+        return str(sender_id) in mapping
+
+    def allows(self, group_id: str | int, sender_id: str | int) -> bool:
+        """两个白名单都要满足（AND），与 bot 的语义一致。"""
+        return self.in_group_whitelist(group_id) and self.in_sender_whitelist(sender_id)
+
+    def whitelist_reason(self, group_id: str | int, sender_id: str | int) -> str | None:
+        """被白名单挡下时给出**是哪一条**挡的（写进镜像，排查时一眼看到）。"""
+        if not self.in_group_whitelist(group_id):
+            return f"whitelist:group 群 {group_id} 不在 CLIENT_GROUP_WHITELIST 里"
+        if not self.in_sender_whitelist(sender_id):
+            return f"whitelist:sender 发送者 {sender_id} 不在 CLIENT_SENDER_WHITELIST 里"
+        return None
 
     @property
     def resolved_mirror_path(self) -> Path:

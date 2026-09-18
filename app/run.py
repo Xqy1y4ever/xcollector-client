@@ -88,6 +88,8 @@ class CycleReport:
     scanned: int = 0
     processed: int = 0
     skipped_unsubscribed: int = 0
+    skipped_whitelist: int = 0
+    reopened: int = 0
     unchanged: int = 0
     recovered: int = 0
     amended: int = 0
@@ -318,6 +320,18 @@ async def _handle_one(
     开着它会让补充/编辑永远不生效，而且是静默的。这个洞是 e2e 抓出来的。
     """
     pair = (message.group_id, message.sender_id)
+
+    # ---- 白名单（本地收窄；留空 = 不限制）----
+    # 放在订阅之前判：这一层是纯本地的，不用发任何请求，先砍掉不看的来源最省事。
+    if subscriptions and not settings.allows(message.group_id, message.sender_id):
+        reason = settings.whitelist_reason(message.group_id, message.sender_id)
+        if record:
+            # 记成 skipped 并**带上 whitelist: 前缀**：前缀是标记，白名单一变就会
+            # 被 reopen_whitelist_skips() 放回来重看（否则改白名单等于没改）。
+            mirror.finish(message.msg_id, state=STATE_SKIPPED, error=reason)
+        report.skipped_whitelist += 1
+        return Outcome(result=OUTCOME_SKIPPED, reason=reason)
+
     if subscriptions and pair not in subscriptions:
         if record:
             mirror.finish(message.msg_id, state=STATE_SKIPPED, error="不在订阅范围内")
@@ -421,10 +435,25 @@ async def run_cycle(
 
     known_raw_ids = await load_processed_raw_ids(backend)
     report.mirror_before = store.stats()
+    dry = settings.client_dry_run
+
+    # ---- 0) 白名单改过了？----
+    # 指纹与上次不同时，把当时"因为白名单被跳过"的消息放回待处理。
+    # 不做这一步的话，用户往白名单里加一个群会发现"什么都没发生" ——
+    # 那些消息早就被记成终态 skipped 了，而他在界面上看不到任何解释。
+    fingerprint = settings.whitelist_fingerprint  # 顺带校验号码形状（错了就地抛）
+    if not dry:
+        previous = store.get_meta("whitelist_fingerprint")
+        if previous is not None and previous != fingerprint:
+            reopened = store.reopen_whitelist_skips()
+            report.reopened = reopened
+            logger.warning(
+                "白名单变了，把之前因它跳过的 %d 条消息放回待处理（重新过一遍）", reopened
+            )
+        store.set_meta("whitelist_fingerprint", fingerprint)
 
     batch_limit = min(settings.client_batch_size, settings.client_max_messages_per_cycle)
     budget = batch_limit
-    dry = settings.client_dry_run
 
     # ---- 1) 先把没做完的做完（崩溃恢复 + 失败重试）----
     # dry-run 下跳过这一步：它的目的是"看看会抽出什么"，不是把积压清掉。
@@ -583,12 +612,13 @@ def _merge(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
 def log_report(report: CycleReport) -> None:
     """把一次循环的结果打成一行（+ 出错时的明细）。"""
     logger.info(
-        "本轮：扫了 %d 条（恢复 %d），跳过 %d 条没变的、%d 条订阅外的，"
+        "本轮：扫了 %d 条（恢复 %d），跳过 %d 条没变的、%d 条订阅外的、%d 条白名单外的，"
         "更新了 %d 条任务，结果=%s",
         report.scanned,
         report.recovered,
         report.unchanged,
         report.skipped_unsubscribed,
+        report.skipped_whitelist,
         report.amended,
         report.outcomes or {},
     )

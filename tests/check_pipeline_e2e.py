@@ -531,6 +531,58 @@ async def run_all() -> int:  # noqa: C901
                 check_true("告警写明了间隔", "16.0 小时" in str(alerts[0].get("reason")), str(alerts[0].get("reason")))
         finally:
             await backend8.close()
+
+        # ----------------------------------------------------------------
+        print("\n--- 14. 白名单：配了就收窄，改了立刻生效 ---")
+        mirror9_path = SCRATCH / f"mirror9-{RUN}.db"
+        db_wl = SCRATCH / f"e2e-wl-{RUN}.db"
+        mirror9 = Mirror(mirror9_path)
+        # 白名单里放一个**别的**群 → 这条明明订阅了的来源会被本地收窄挡下
+        settings9 = make_settings(
+            token, db_wl, client_mirror_path=str(mirror9_path),
+            client_group_whitelist="199999999",
+        )
+        backend9 = BackendClient(settings9)
+        try:
+            make_source_db(db_wl, [
+                {"msg_id": "600", "ts": BASE_TS + 6000, "text": "下周三前交材料",
+                 "content": text_of("下周三前交材料")},
+            ])
+            count_before = len(notifications(token))
+            report = await run_cycle(backend9, settings9, db=SourceDatabase(db_wl), mirror=mirror9)
+            check("被白名单挡下", report.skipped_whitelist, 1)
+            check("一条通知都没建", len(notifications(token)), count_before)
+            check("镜像里是 skipped（终态）", mirror9.get("600").state, STATE_SKIPPED)
+            check_true(
+                "原因带 whitelist: 前缀（改白名单时就是靠它认出来的）",
+                str(mirror9.get("600").last_error).startswith("whitelist:"),
+                str(mirror9.get("600").last_error),
+            )
+
+            # 白名单改成放行这个群 → 之前被挡的那条要**立刻**被重看
+            settings10 = make_settings(
+                token, db_wl, client_mirror_path=str(mirror9_path),
+                client_group_whitelist=GROUP,
+            )
+            backend10 = BackendClient(settings10)
+            try:
+                report = await run_cycle(
+                    backend10, settings10, db=SourceDatabase(db_wl), mirror=mirror9
+                )
+                check("白名单改过 → 把之前跳过的那条放回来", report.reopened, 1)
+                check("于是它真的入库了", len(notifications(token)), count_before + 1)
+                check("镜像里变成 done", mirror9.get("600").state, STATE_DONE)
+
+                # 指纹没变时不该重复放回（否则每轮都重抽一遍）
+                report = await run_cycle(
+                    backend10, settings10, db=SourceDatabase(db_wl), mirror=mirror9
+                )
+                check("指纹没变就不放回", report.reopened, 0)
+                check("也没重抽（内容没变）", report.processed, 0)
+            finally:
+                await backend10.close()
+        finally:
+            await backend9.close()
     finally:
         await backend.close()
 
