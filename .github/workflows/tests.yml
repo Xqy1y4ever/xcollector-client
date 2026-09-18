@@ -45,3 +45,12 @@ jobs:
 
       - name: 配置三方对账（字段 ↔ 环境变量 ↔ 代码）
         run: python -m tests.check_config
+
+      # 这套自检是"解密 + 导出"能不能信的根据：
+      #   1) 用本仓库自己的 PageCodec 把一份真 SQLite 库按 SQLCipher 格式加密，
+      #      再解密回来逐页比对字节；
+      #   2) 密钥错 / 密文被改 / IV 被改 / 页被换序 / 源库缺尾，都必须**当场失败**，
+      #      而不是给出一份"看起来正常"的乱码库。
+      # 它不需要网络，也不需要 sqlcipher3。
+      - name: nt_msg.db 解密与导出（SQLCipher 页格式 / wire / 导出）
+        run: python -m tests.check_ntmsg_db

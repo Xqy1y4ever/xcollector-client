@@ -43,6 +43,9 @@ from .mirror import (
     STATE_SKIPPED,
     Mirror,
 )
+from .ntmsg_db import PrepareReport, prepare_databases
+from .ntmsg_db.decrypt import DecryptError
+from .ntmsg_db.export import ExportError
 from .pipeline.process import (
     OUTCOME_AMENDED,
     OUTCOME_DEGRADED,
@@ -95,6 +98,8 @@ class CycleReport:
     amended: int = 0
     outcomes: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    # 这一轮的"解密 + 导出"做了什么（没配 CLIENT_NT_MSG_DB 时是 None）
+    prepared: str | None = None
     mirror_before: dict = field(default_factory=dict)
     mirror_after: dict = field(default_factory=dict)
     latest_in_db: tuple[int, str] | None = None
@@ -173,10 +178,11 @@ async def resolve_amendment_target(
       1. 引用里那个值是**消息 id** → 直接在镜像里查；
       2. 是**群内序号** → 用源表的序号列（`40003` 之类）反查消息 id。
 
-    第 2 条路在当前 `nt_msg_db_util` 的 `group_messages` 里走不通 —— 那张表
-    **没有序号列**（字段文档还说回复里的 `47422` 与主表 `40001` 不匹配）。
-    所以"补充关系认不出来"是数据源的限制，不是逻辑没写：这里会把原因打出来，
-    让人知道该去补哪一块，而不是静默地把补充当成一条独立的新任务。
+    第 2 条路依赖源表带"群内序号"列：**本客户端自己导出的库带**（`app/ntmsg_db/export.py`
+    会额外输出 `"40003"` / `"40850"`），而上游 `nt_msg_db_util` 的 `group_messages`
+    没有这一列（字段文档还说回复里的 `47422` 与主表 `40001` 不匹配）。
+    所以读上游的库时"补充关系认不出来"是数据源的限制，不是逻辑没写：这里会把原因
+    打出来，让人知道该去补哪一块，而不是静默地把补充当成一条独立的新任务。
     """
     ref = (message.quote_ref or "").strip()
     if not ref:
@@ -184,21 +190,34 @@ async def resolve_amendment_target(
 
     target_id: str | None = None
     how = ""
+    ambiguous = 0
 
     row = mirror.get(ref)
     if row is not None:
         target_id, how = ref, "引用里直接是消息 id"
     else:
-        resolved = database.resolve_seq(message.group_id, ref)
+        resolved, matches = database.resolve_seq_detail(message.group_id, ref)
         if resolved:
             target_id, how = resolved, f"按群内序号 {ref} 反查到 {resolved}"
+        elif matches > 1:
+            ambiguous = matches
 
     if not target_id:
-        if not database.seq_column():
+        if ambiguous:
+            logger.info(
+                "引用里的群内序号 %r 在同一群里对上了 %d 条消息（序号被复用过，"
+                "实测 769,003 行里有 2.1 万个这样的组合）—— **不敢认**，"
+                "按独立的新消息处理（msg_id=%s）。宁可少一次合并，也不能改错任务。",
+                ref,
+                ambiguous,
+                message.msg_id,
+            )
+        elif not database.seq_column():
             logger.info(
                 "这条消息引用了 %r，但源表没有「群内序号」列，无法确定它在补充哪一条 —— "
                 "按独立的新消息处理（msg_id=%s）。"
-                "如果你用的导出工具能带上 40003/seq 那一列，这个关系就能确定下来。",
+                "用本客户端自己导出的库（CLIENT_NT_MSG_DB）会带上 40003/40850 这两列，"
+                "这个关系就能确定下来。",
                 ref,
                 message.msg_id,
             )
@@ -413,7 +432,6 @@ async def run_cycle(
     """跑一次同步。**任何一条消息失败都不会中断整批**（错误进 report）。"""
     report = CycleReport()
     moment = now_ms() if now is None else now
-    database = db or SourceDatabase(settings.resolved_db_path)
     attachment_resolver = resolver or AttachmentResolver(settings.resolved_attachment_root)
     store = mirror or Mirror(settings.resolved_mirror_path)
 
@@ -432,6 +450,24 @@ async def run_cycle(
         )
         report.errors.append("还没有订阅任何来源，本轮未做任何事（镜像未动）")
         return report
+
+    # ---- 0) 源库要先准备好（解密 + 导出）----
+    #
+    # 放在订阅检查**之后**：没有订阅时这一轮本来就什么都不做，没必要花几分钟去解一个
+    # 几个 GB 的库。也放在打开源库之前 —— 这一步失败必须让整轮停下来：带着一个
+    # 没更新成功的旧库继续跑，界面看起来一切正常，而新通知一条都没进来。
+    if db is None and settings.ntmsg_pipeline_enabled:
+        try:
+            prepared = prepare_databases(settings)
+        except (DecryptError, ExportError) as exc:
+            logger.error("准备源库失败，本轮不做任何事：%s", exc)
+            report.errors.append(f"准备源库失败：{exc}")
+            return report
+        report.prepared = prepared.summary()
+        logger.info("源库准备：%s", report.prepared)
+        database = SourceDatabase(prepared.export_path)
+    else:
+        database = db or SourceDatabase(settings.resolved_db_path)
 
     known_raw_ids = await load_processed_raw_ids(backend)
     report.mirror_before = store.stats()
@@ -622,6 +658,8 @@ def log_report(report: CycleReport) -> None:
         report.amended,
         report.outcomes or {},
     )
+    if report.prepared:
+        logger.info("源库准备：%s", report.prepared)
     if report.mirror_after:
         logger.info(
             "镜像：共 %d 条（%s），补充关系 %d 条",

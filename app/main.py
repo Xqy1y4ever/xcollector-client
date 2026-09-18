@@ -45,6 +45,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--once", action="store_true", help="只跑一轮就退出（推荐配合计划任务）")
     mode.add_argument("--loop", action="store_true", help="常驻，按 CLIENT_POLL_SECONDS 定期跑")
     mode.add_argument("--status", action="store_true", help="只做自检与统计，不写任何东西")
+    parser.add_argument(
+        "--prepare",
+        action="store_true",
+        help="只做「解密 nt_msg.db + 导出」，强制重跑一遍然后退出",
+    )
     parser.add_argument("--dry-run", action="store_true", help="只组装不写入")
     parser.add_argument("--since-hours", type=int, default=None, help="忽略游标，从 N 小时前重扫")
     parser.add_argument("--limit", type=int, default=None, help="本轮最多处理多少条")
@@ -59,7 +64,7 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
     print("=== 配置 ===")
     print(f"  后端            {settings.backend_base}")
     print(f"  令牌            {'UserToken' if settings.is_user_token else '⚠️ 不是 UserToken（可能是服务令牌）'}")
-    print(f"  源库            {settings.resolved_db_path}")
+    print(f"  源库            {settings.ntmsg_export_path}")
     print(f"  镜像库          {settings.resolved_mirror_path}")
     print(f"  附件根目录      {settings.resolved_attachment_root or '（未配置，附件只能留远程地址）'}")
     group_wl = settings.client_group_whitelist.strip() or "（不限制）"
@@ -74,10 +79,54 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
         f"（只认 {settings.client_amendment_max_age_hours}h 之内的引用）"
     )
 
+    print("\n=== nt_msg 前置步骤（剥头 + 解密 + 导出）===")
+    if not settings.ntmsg_pipeline_enabled:
+        print("  未配置 CLIENT_NT_MSG_DB → 直接用 CLIENT_DB_PATH 指向的导出库")
+    else:
+        print(f"  nt_msg.db       {settings.client_nt_msg_db}")
+        if settings.client_nt_msg_key_file.strip():
+            print(f"  密钥来源        CLIENT_NT_MSG_KEY_FILE={settings.client_nt_msg_key_file}")
+        elif settings.client_nt_msg_key.strip():
+            # **只报长度**，绝不打印密钥本身 —— 这一行经常被贴进 issue/聊天里。
+            print(
+                f"  密钥来源        CLIENT_NT_MSG_KEY（{len(settings.client_nt_msg_key.strip())} 个字符）"
+            )
+        else:
+            print("  ⚠️ 密钥          没配（CLIENT_NT_MSG_KEY / CLIENT_NT_MSG_KEY_FILE 都是空的）")
+        print(
+            f"  解密参数        header={settings.client_nt_msg_header_size} "
+            f"page_size={settings.client_nt_msg_page_size} "
+            f"kdf_iter={settings.client_nt_msg_kdf_iter} "
+            f"kdf={settings.client_nt_msg_kdf_algorithm} "
+            f"hmac={settings.client_nt_msg_hmac_algorithm}"
+        )
+        print(
+            f"  中间产物        clear={settings.client_nt_msg_clear_path or '(默认：nt_msg.db 旁边)'} "
+            f"plain={settings.client_nt_msg_plain_path or '(默认：nt_msg.db 旁边)'}"
+        )
+        tables = settings.client_decrypt_tables.strip() or "（全部，和上游一样）"
+        print(f"  只解密这些表    {tables}")
+        skips = settings.client_decrypt_max_skips
+        print(
+            f"  SQLite 自检     {settings.client_decrypt_integrity}"
+            f"（坏页最多跳过 {'不限' if skips < 0 else skips} 行，每次跳过都会报 ERROR）"
+        )
+        print(
+            f"  导出            c2c={'是' if settings.client_export_include_c2c else '否'}"
+            f"，补序号列={'是' if settings.client_export_add_seq else '否'}"
+        )
+
     print("\n=== 源库 ===")
     try:
         info = db.inspect()
     except SourceDatabaseError as exc:
+        if settings.ntmsg_pipeline_enabled and not settings.ntmsg_export_path.exists():
+            print(
+                f"  还没生成：{settings.ntmsg_export_path}\n"
+                "  先跑一次 `python -m app.main --prepare`（只解密+导出，不入库），"
+                "再回来看这一节。"
+            )
+            return 1
         print(f"  ❌ {exc}")
         return 1
     print(f"  表 {info['table']}，共 {info['rows']} 行")
@@ -129,8 +178,63 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
     return 0
 
 
+async def run_prepare(settings) -> int:
+    """`--prepare`：强制重跑一遍「解密 + 导出」，不做任何入库动作。
+
+    单独留这个入口，是因为第一次配置密钥/参数时最容易出错，而"跑一轮同步"会把
+    解密、导出、模型调用混在一起，看不出问题出在哪一步。`--prepare` 只碰本地文件。
+    """
+    from .ntmsg_db import prepare_databases
+    from .ntmsg_db.decrypt import DecryptError
+    from .ntmsg_db.export import ExportError
+
+    if not settings.ntmsg_pipeline_enabled:
+        logger.error(
+            "没有配置 CLIENT_NT_MSG_DB，没有可准备的东西。"
+            "（--prepare 是给「只给一个 nt_msg.db 路径」这种用法准备的）"
+        )
+        return 2
+    try:
+        report = prepare_databases(settings, force=True)
+    except (DecryptError, ExportError) as exc:
+        logger.error("准备失败：%s", exc)
+        return 2
+    print("=== 剥头 + 解密 + 导出 ===")
+    print(f"  nt_msg.db       {settings.client_nt_msg_db}")
+    print(f"  剥头产物        {report.clear_path}")
+    print(f"  明文库          {report.plain_path}")
+    print(f"  导出库          {report.export_path}")
+    if report.decrypt is not None:
+        print(f"  解密            {report.decrypt.summary()}")
+        print(f"  SQLite 自检     {report.decrypt.integrity}")
+        for item in report.decrypt.per_table:
+            flag = "  ⚠️ 跳过 %d 行" % item.skipped_rows if item.skipped_rows else ""
+            print(
+                f"      {item.table:<24} {item.copied_rows:>9,}/{item.source_rows:<9,} 行{flag}"
+            )
+        if report.decrypt.skipped_rowids:
+            print(f"  ⚠️ 被跳过的 rowid {report.decrypt.skipped_rowids}")
+    if report.export is not None:
+        print(f"  导出            {report.export.summary()}")
+        for table, written in report.export.written_rows.items():
+            print(f"      {table:<24} {written:>9,} 行")
+    print("\n下一步：python -m app.main --status 看看源库和订阅。")
+    return 0
+
+
 async def run_once(backend: BackendClient, settings, *, since_hours: int | None = None) -> int:
-    db = SourceDatabase(settings.resolved_db_path)
+    from .ntmsg_db import prepare_databases
+    from .ntmsg_db.decrypt import DecryptError
+    from .ntmsg_db.export import ExportError
+
+    prepared = None
+    if settings.ntmsg_pipeline_enabled:
+        try:
+            prepared = prepare_databases(settings)
+        except (DecryptError, ExportError) as exc:
+            logger.error("准备源库失败：%s", exc)
+            return 2
+    db = SourceDatabase(prepared.export_path if prepared else settings.resolved_db_path)
     try:
         db.inspect()
     except SourceDatabaseError as exc:
@@ -176,10 +280,13 @@ async def amain(args: argparse.Namespace) -> int:
     if not settings.backend_base_url:
         logger.error("没有配置 BACKEND_BASE_URL")
         return 2
-    if not settings.client_db_path:
+    if not settings.client_db_path and not settings.ntmsg_pipeline_enabled:
         logger.error(
-            "没有配置 CLIENT_DB_PATH —— 它要指向 nt_msg_db_util 的 3.export.py 产出的 "
-            "nt_msg_export.db（明文 SQLite），不是 nt_msg.db。"
+            "既没有配置 CLIENT_NT_MSG_DB，也没有配置 CLIENT_DB_PATH。二选一：\n"
+            "  · CLIENT_NT_MSG_DB = 加密的 nt_msg.db 路径（+ CLIENT_NT_MSG_KEY），"
+            "客户端自己解密并导出；\n"
+            "  · CLIENT_DB_PATH  = 现成的 nt_msg_export.db 路径"
+            "（上游 nt_msg_db_util 的 3.export.py 产物，或本客户端上次的产物）。"
         )
         return 2
 
@@ -192,11 +299,13 @@ async def amain(args: argparse.Namespace) -> int:
         logger.error("配置有问题：%s", exc)
         return 2
 
-    db = SourceDatabase(settings.resolved_db_path)
+    db = SourceDatabase(settings.ntmsg_export_path)
     backend = BackendClient(settings)
     try:
         if args.status:
             return await show_status(backend, settings, db)
+        if args.prepare:
+            return await run_prepare(settings)
         await verify_identity(backend, settings)
         if args.loop or not args.once:
             await run_loop(backend, settings)

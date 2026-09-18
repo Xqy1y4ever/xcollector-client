@@ -112,6 +112,61 @@ class Settings(BaseSettings):
     # 找不到字节时怎么记：`url`（只留 CDN 地址，可能是死链）/ `skip`（不记附件）
     client_missing_attachment: Literal["url", "skip"] = "url"
 
+    # ---------------- nt_msg.db：剥头 + 解密 + 导出（可选的一整套前置步骤） ----------------
+    # 配了 `CLIENT_NT_MSG_DB` 之后，客户端就**只要这一个输入**：
+    #
+    #   nt_msg.db ─剥头→ nt_msg_clear.db ─解密→ nt_msg_plain.db ─导出→ nt_msg_export.db
+    #
+    # 这三步就是 `nt_msg_db_util` 的 `1.decrypt.py` 与 `3.export.py`（已整合进本项目，
+    # 见 `app/ntmsg_db/`）。不解密的话，用户得自己跑那两个脚本。
+    #
+    # **留空 = 完全不起作用**：行为和以前一样，直接读 CLIENT_DB_PATH。
+    client_nt_msg_db: str = ""
+    # 密钥（16 字节 ASCII，从 NTQQ 进程内存里自己取；见 README）。**别提交进仓库。**
+    client_nt_msg_key: str = ""
+    # 或者从文件读密钥 —— 比放进环境变量好：环境变量会出现在 `ps`/`/proc`、
+    # 容器 inspect、以及 CI 日志里。文件内容首尾空白会被去掉。
+    client_nt_msg_key_file: str = ""
+    # 中间产物放哪。留空 = 放在 nt_msg.db 旁边（上游的默认命名）。
+    client_nt_msg_clear_path: str = ""
+    client_nt_msg_plain_path: str = ""
+    # nt_msg.db 前面那段 QQ 自定义头的长度（固定 1024）。
+    client_nt_msg_header_size: int = 1024
+    # 下面这几个是上游 1.decrypt.py 用的 PRAGMA 值，**不要随便改**
+    # （改了就等于换了一套加密参数，只有你自己造过库才需要）。
+    client_nt_msg_page_size: int = 4096
+    client_nt_msg_kdf_iter: int = 4000
+    client_nt_msg_kdf_algorithm: Literal["sha1", "sha256", "sha512"] = "sha512"
+    client_nt_msg_hmac_algorithm: Literal["sha1", "sha256", "sha512"] = "sha1"
+    # 解密这一步要不要跑（关掉 = 明文库/导出库你自己维护）。
+    client_decrypt_enabled: bool = True
+    # 每批从加密库读多少行（遇坏页会自动缩小，成功后再放大回来）。
+    client_decrypt_batch_size: int = 5000
+    # 只解密哪些表，逗号分隔。留空 = 全部（上游行为）。
+    #
+    # 客户端只用到 group_msg_table / c2c_msg_table，但其余表都不大，所以默认全拷
+    # （好处是得到的 nt_msg_plain.db 和上游一样，能直接给 nt_msg_search.py 用）。
+    client_decrypt_tables: str = ""
+    # 解完让 SQLite 自己查一遍明文库：quick（默认）/ full / off。只影响报告。
+    client_decrypt_integrity: Literal["quick", "full", "off"] = "quick"
+    # 允许多少行因为坏页被跳过。-1 = 不限（上游行为）。
+    #
+    # 坏页是真实存在的（上游为此专门写了"重连 + 缩小批次 + 跳过坏 rowid"）。
+    # 默认容忍是为了不因为一个坏页卡死整天，但**每一次跳过都会打 ERROR 级日志并
+    # 记进报告** —— 被跳过的行意味着那几条消息永远进不来，这必须让人看见。
+    client_decrypt_max_skips: int = -1
+    # 导出这一步要不要跑。
+    client_export_enabled: bool = True
+    # 要不要连私聊消息一起导。默认 true = 和上游 3.export.py 一样两张表都导；
+    # 客户端本身只入库群通知（订阅是按 (群, 发送者) 组织的），私聊只是顺带。
+    client_export_include_c2c: bool = True
+    client_export_batch: int = 2000
+    # 给 group_messages 补 "40003"/"40850" 两列（群内序号、被回复消息的序号）。
+    # 上游的导出表没有它们，"这条消息在补充哪条通知"就没法确定性反查。
+    client_export_add_seq: bool = True
+    # 增量导出时往回多看多少秒（导出是幂等的，多看一点只会慢一点）。
+    client_export_overlap_seconds: int = 3600
+
     # ---------------- 镜像库（客户端自己的状态） ----------------
     # 客户端**自己**维护一份 SQLite，只记「这条源消息处理过没有」+ 它的内容指纹。
     # 增量就靠它，不再依赖后端里的游标：
@@ -278,10 +333,15 @@ class Settings(BaseSettings):
 
     @property
     def resolved_mirror_path(self) -> Path:
-        """镜像库路径。默认放在源库旁边 —— 一个源库对应一份状态，天然不会串。"""
+        """镜像库路径。默认放在**源库**旁边 —— 一个源库对应一份状态，天然不会串。
+
+        用 `ntmsg_export_path` 而不是 `resolved_db_path`：走"只给 nt_msg.db"那条路时
+        `CLIENT_DB_PATH` 可以是空的，那时导出库在 nt_msg.db 旁边，镜像也该在那儿（而且
+        这样从"手动导出"切到"客户端自己导出"时，只要导出库路径没变，状态就还在）。
+        """
         if self.client_mirror_path.strip():
             return Path(self.client_mirror_path).expanduser()
-        source = self.resolved_db_path
+        source = self.ntmsg_export_path
         return source.with_name(source.name + ".mirror.db")
 
     @property
@@ -322,6 +382,25 @@ class Settings(BaseSettings):
     @property
     def resolved_db_path(self) -> Path:
         return Path(self.client_db_path).expanduser()
+
+    @property
+    def ntmsg_pipeline_enabled(self) -> bool:
+        """要不要自己做"解密 + 导出"（配了 `CLIENT_NT_MSG_DB` 才需要）。"""
+        return bool((self.client_nt_msg_db or "").strip())
+
+    @property
+    def ntmsg_export_path(self) -> Path:
+        """这一轮真正要读的库。
+
+        配了 `CLIENT_NT_MSG_DB` 时，导出库**默认放在 nt_msg.db 旁边**
+        （`nt_msg_export.db`），而不是要求用户再配一个 `CLIENT_DB_PATH`；
+        两者都配了就听 `CLIENT_DB_PATH` 的。
+        """
+        if not self.ntmsg_pipeline_enabled:
+            return self.resolved_db_path
+        if self.client_db_path.strip():
+            return self.resolved_db_path
+        return Path(self.client_nt_msg_db).expanduser().with_name("nt_msg_export.db")
 
     @property
     def resolved_attachment_root(self) -> Path | None:

@@ -1,4 +1,4 @@
-"""读 `nt_msg_db_util` 导出的结构化库 `nt_msg_export.db`。
+"""读结构化导出库 `nt_msg_export.db`（上游 `nt_msg_db_util` 的产物，或本客户端自己导的）。
 
 ## 表结构从哪来的
 
@@ -17,8 +17,27 @@
       parse_status  TEXT               null / typed / wire_fallback / invalid
       content       TEXT               40800 解析出来的 JSON，带 type 鉴别字段
 
-`content` 的 `type` 有：text / image / video / file / sticker / contact / reply /
-forward / legacy_forward / call / sys / mixed。
+`content` 的形状由导出方决定，本读取器两种都认：
+
+* **上游 `nt_msg_db_util` 的 `3.export.py`**（也就是本客户端自己导出的形状）：
+
+      {"type":"msg_body","segments":[
+          {"content_type":1,"text":"【教务处】下周三前交材料"},
+          {"content_type":2,"img_width":1080,"filesize":204800,
+           "md5_raw":"3q2+7w==","cdn_url_1":"http://..."}]}
+
+  段里的字段是 **protobuf 原生名**，二进制字段是 **base64** —— 所以附件提取
+  （`attachments_from_content`）要按 `content_type` 判类型、把 `md5_raw` 解成十六进制。
+
+* 带 `type` 鉴别字段的旧形状（`{"type":"image","filename":...,"md5_hex":...}`）。
+
+`parse_status` 的取值（上游 `msgdb/proto/c2c_40800_parser.py`）：
+`null` / `typed` / `wire_fallback` / `invalid`。
+
+**本客户端自己导出的库额外带两列**：`"40003"`（群内消息序号）和 `"40850"`
+（被回复消息的群内序号）。这是刻意的增强：有了它们，"这条消息是在补充哪条通知"
+才能反查到 `msg_id`（见 `seq_column()` / `resolve_seq()`）。上游的导出表没有这两列，
+那时这一层会退回从正文里找引用字段，找不到就如实报告"解析不了"而不是硬猜。
 
 ## 这个读取器刻意做的几件事
 
@@ -82,8 +101,11 @@ class SourceMessage:
     # 这条消息是回复/引用时，被引用对象的**原始标识值**（可能是消息 id，
     # 也可能是群内序号 —— 两者形状不同，所以这里不猜，交给上层去试）。
     quote_ref: str | None = None
-    # 群内消息序号（nt_msg_db_util 文档里的 `40003`）。**导出表当前没有这一列**，
-    # 所以默认是 None；有这一列时"回复 → 被回复的那条"才能确定性地解析出来。
+    # 群内消息序号（nt_msg_db_util 文档里的 `40003`）。
+    #
+    # **上游的 `group_messages` 没有这一列**，所以读上游导出库时它是 None；
+    # 而本客户端自己导出的库会额外带上 `"40003"` / `"40850"`，有了它
+    # "回复 → 被回复的那条"才能确定性地解析出来（见 `resolve_seq`）。
     seq: str | None = None
 
     @property
@@ -91,26 +113,62 @@ class SourceMessage:
         return int(self.timestamp) * 1000
 
 
-# 回复/引用里可能装着"被引用对象"的键名。
+# 回复/引用里可能装着"被引用对象"的键名 —— **按顺序就是优先级**。
+#
+# 上游 `3.export.py` 导出的 `content` 里是 **protobuf 原生字段名**（`reply_msg_seq`
+# 这种），所以前几个是原生名；数字键名是留给别的导出实现的（也留着，因为
+# `Content` 里我们自己也补过数字键）。
 #
 # 依据是 nt_msg_db_util 的群字段文档：
-#   47402 与同一会话的 40003 群内消息序号高度匹配 → 适合当"回复目标"读
-#   47422 未与主表 40001 匹配 → 只是内部来源 ID，**不能**当消息 id 用
-# 另外几个是同义命名，遇上就一起认（多认一个键不会造成错判，
-# 因为解析出来后还要在镜像里真的命中某一条才作数）。
+#   47402 `reply_msg_seq` 与同一会话的 40003 群内消息序号高度匹配 → 适合当"回复目标"
+#   47401 `reply_msg_id`  只是"候选 ID"
+#   47422 `reply_source_record_id` 未与主表 40001 匹配 → 最后才试
+# 多认几个键不会造成错判：解析出来后还要在镜像/源表里**真的命中某一条**才作数。
 DEFAULT_QUOTE_KEYS = (
+    "reply_msg_seq",            # 47402，最可靠
     "47402",
-    "47422",
     "reply_seq",
     "quoted_seq",
     "quote_seq",
+    "reply_msg_id",             # 47401，候选
     "reply_id",
     "quoted_msg_id",
     "quote_id",
+    "reply_source_record_id",   # 47422，已知对不上主表
+    "47422",
 )
+
+# 段级内容类型（`45002`）→ 附件类型。数字含义来自上游的 `db_docs/*/40800.md`。
+SEGMENT_MEDIA_TYPES: dict[int, str] = {
+    2: "image",
+    3: "file",
+    4: "file",      # 语音：当文件处理（客户端只需要一个能下载/命名的东西）
+    5: "video",
+    11: "sticker",  # 表情
+}
+
+# protobuf-JSON 里二进制字段是 base64，所以 `md5_raw` 得先解码再转十六进制。
+_MD5_KEYS = ("md5_hex", "md5_raw", "md5")
+_URL_KEYS = ("cdn_url", "cdn_url_1", "cdn_url_2", "cdn_url_3", "url")
+_NAME_KEYS = ("filename", "name")
+_SIZE_KEYS = ("filesize", "size")
+_WIDTH_KEYS = ("width", "img_width")
+_HEIGHT_KEYS = ("height", "img_height")
+_EXT_KEYS = ("ext", "file_ext")
+_PATH_KEYS = ("local_path", "cdn_path")
+
+# 往下找"段"的容器键。**刻意不含 `ref_msg`**：那是被引用消息的完整内容，
+# 把它里面的图片算成本条消息的附件是错的。
+_SEGMENT_CONTAINERS = ("segments", "content", "items", "children", "mixed")
+
 
 # 群内序号列的候选名（导出表里有就用，没有就明说解析不了）
 SEQ_COLUMN_CANDIDATES = ("40003", "seq", "msg_seq", "message_seq")
+
+# 除了 OPTIONAL_COLUMNS 之外还要一起取出来的列：序号与"被回复消息的序号"。
+# 这两个是本客户端自己导出时补上的（见 app/ntmsg_db/export.py）。
+_EXTRA_COLUMNS = (*SEQ_COLUMN_CANDIDATES, "40850")
+
 
 
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -128,17 +186,138 @@ def _json_or_none(text: Any) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+def _decode_md5(value: Any) -> str | None:
+    """把 md5 字段统一成十六进制字符串。
+
+    上游导出的 `md5_raw` 是 **bytes**，经 protobuf 的 JSON 转换后是 **base64**
+    （`MessageToDict` 的默认行为），所以这里要解 base64 再转 hex。
+    也兼容直接就是十六进制字符串的情况（别的导出实现会这么写）。
+    """
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    # 已经是十六进制就直接用（奇数长度不可能是十六进制）
+    if len(text) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in text):
+        return text.lower()
+    try:
+        import base64
+
+        raw = base64.b64decode(text, validate=True)
+    except Exception:  # noqa: BLE001 - 不是 base64 就当它没用
+        return None
+    return raw.hex() if raw else None
+
+
+def _pick(node: dict, keys: Sequence[str]) -> Any:
+    for key in keys:
+        value = node.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _as_int(value: Any) -> int | None:
+    """把值转成 int。
+
+    需要这个是因为 **protobuf 的 JSON 把 int64 渲染成字符串**（int32 才是数字）：
+    在真实数据里 `"filesize": "354549"`、`"reply_msg_seq": "1070244"` 都是字符串，
+    而 `"img_width": 648` 是数字。只看 `isinstance(value, int)` 会把大小丢掉。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text and (text.lstrip("-").isdigit()):
+            try:
+                return int(text)
+            except ValueError:
+                return None
+    return None
+
+
+def _segment_attachment(node: dict) -> dict | None:
+    """把一个"段"（`content` 里的一个 segment）翻成附件记录；不是媒体就返回 None。
+
+    支持两种形状：
+
+    * **上游 `3.export.py` 的形状**（现在是主要的）：段是 protobuf 原生 JSON，
+      媒体类型看 `content_type`，字段是 `md5_raw`（base64）/`cdn_url_1`/`filesize`…
+    * 带 `type` 鉴别字段的旧形状（别的导出实现或早期版本）：`{"type":"image",...}`。
+    """
+    kind = ""
+    explicit = str(node.get("type") or "")
+    if explicit in ("image", "video", "file", "sticker"):
+        kind = explicit
+    else:
+        content_type = node.get("content_type")
+        if isinstance(content_type, int):
+            kind = SEGMENT_MEDIA_TYPES.get(content_type, "")
+    if not kind:
+        return None
+
+    item: dict[str, Any] = {"type": "image" if kind == "sticker" else kind}
+
+    md5 = None
+    for key in _MD5_KEYS:
+        md5 = _decode_md5(node.get(key))
+        if md5:
+            break
+    if md5:
+        item["md5"] = md5
+
+    url = _pick(node, _URL_KEYS)
+    if isinstance(url, str) and url:
+        item["url"] = url
+
+    name = _pick(node, _NAME_KEYS)
+    if isinstance(name, str) and name:
+        item["name"] = name
+    else:
+        # 没有文件名字段时从本地路径里取（只在真有条路径时；**不编名字**）
+        path = _pick(node, _PATH_KEYS)
+        if isinstance(path, str) and path and not path.startswith("http"):
+            item["name"] = path.replace("\\", "/").rsplit("/", 1)[-1]
+
+    size = _as_int(_pick(node, _SIZE_KEYS))
+    if size is not None and size >= 0:
+        item["size"] = size
+    for src_keys, dst in ((_WIDTH_KEYS, "width"), (_HEIGHT_KEYS, "height")):
+        value = _as_int(_pick(node, src_keys))
+        if value is not None and value > 0:
+            item[dst] = value
+    ext = _pick(node, _EXT_KEYS)
+    if isinstance(ext, str) and ext:
+        item["ext"] = ext if ext.startswith(".") else f".{ext}"
+    if kind == "sticker":
+        item["sticker_id"] = 0
+
+    # 一条既没有 url 也没有文件名也没有 md5 的附件是没用的：记下来只会让前端
+    # 显示一个打不开的空条目。
+    if item.get("url") or item.get("name") or item.get("md5"):
+        return item
+    return None
+
+
 def attachments_from_content(content: dict | None) -> list[dict]:
     """从 `content` JSON 里挑出附件。
 
-    形状（`nt_msg_db_util` 的 `content` 是按 type 变的）：
+    上游导出的形状（`nt_msg_db_util` 的 `msgdb/group/exporter.py`）：
 
-        {"type":"image","filename":"x.jpg","width":1080,"cdn_url":"...","md5_hex":"..."}
-        {"type":"file","filename":"a.pdf","filesize":1024,"md5_hex":"...","ext":".pdf"}
-        {"type":"mixed","segments":[...]}   ← 一段一段往下找
+        {"type":"msg_body","segments":[
+            {"content_type":2,"img_width":1080,"filesize":204800,
+             "md5_raw":"3q2+7w==","cdn_url_1":"http://..."}, ...]}
 
-    **不猜附件地址**：只有 `cdn_url` 时也照样记下来（那可能是死链，所以
-    下载失败要有一条明确的日志与降级说明，不能安静地当没有）。
+    也兼容带 `type` 鉴别字段的旧形状（`{"type":"image","filename":...}`）。
+
+    **不猜附件地址**：只有 `cdn_url` 时也照样记下来（那可能是死链，所以下载失败
+    要有一条明确的日志与降级说明，不能安静地当没有）。**不递归进 `ref_msg`** ——
+    那是被引用消息的内容，把它里面的图算成本条消息的附件是错的。
     """
     if not isinstance(content, dict):
         return []
@@ -152,27 +331,11 @@ def attachments_from_content(content: dict | None) -> list[dict]:
             return
         if not isinstance(node, dict):
             return
-        kind = str(node.get("type") or "")
-        if kind in ("image", "video", "file", "sticker"):
-            item: dict[str, Any] = {"type": "image" if kind == "sticker" else kind}
-            for src, dst in (
-                ("filename", "name"),
-                ("cdn_url", "url"),
-                ("md5_hex", "md5"),
-                ("filesize", "size"),
-                ("width", "width"),
-                ("height", "height"),
-                ("ext", "ext"),
-            ):
-                if node.get(src) is not None:
-                    item[dst] = node[src]
-            # 一条既没有 url 也没有 filename 的附件是没用的：记下来只会让
-            # 前端显示一个打不开的空条目。
-            if item.get("url") or item.get("name") or item.get("md5"):
-                out.append(item)
+        found = _segment_attachment(node)
+        if found is not None:
+            out.append(found)
             return
-        # mixed / reply / forward：往下找
-        for key in ("segments", "content", "items", "children"):
+        for key in _SEGMENT_CONTAINERS:
             if key in node:
                 walk(node[key])
 
@@ -187,37 +350,38 @@ def quote_ref_from_content(content: dict | None, keys: Sequence[str] = DEFAULT_Q
     解释留给上层（先当消息 id 在镜像里找，找不到再按序号解析），因为把这两种
     混在一起猜会得到一个"看起来对、其实指错任务"的结果 —— 那比不做还糟。
 
-    **统一转成字符串**：`content` 是想保留原始 wire 值的（文档明确要求未知
-    length-delimited 字段保留为 bytes），所以同一个语义字段在不同消息里可能是
-    整数也可能是字符串；这里统一成十进制字符串，免得 `47402` 一会儿是 int
-    一会儿是 str，让上层比不出来。
+    **按 `keys` 的顺序找**（不是按 JSON 里的键顺序）：`47401` 和 `47402` 常常同时
+    出现，而字段文档说 `47402`（群内序号）才是可靠的、`47401` 只是"候选"，
+    所以优先级必须由调用方给的这个序列决定。
     """
     if not isinstance(content, dict):
         return None
-    wanted = {str(k) for k in keys}
-    found: str | None = None
 
-    def walk(node: Any) -> None:
-        nonlocal found
-        if found is not None:
-            return
+    def find(node: Any, key: str) -> str | None:
         if isinstance(node, list):
             for item in node:
-                walk(item)
-            return
+                hit = find(item, key)
+                if hit:
+                    return hit
+            return None
         if not isinstance(node, dict):
-            return
-        for key, value in node.items():
-            if str(key) in wanted and isinstance(value, (int, str)) and not isinstance(value, bool):
-                text = str(value).strip()
-                if text and text.lower() not in ("none", "null", "0", ""):
-                    found = text
-                    return
-        for value in node.values():
-            walk(value)
+            return None
+        value = node.get(key)
+        if isinstance(value, (int, str)) and not isinstance(value, bool):
+            text = str(value).strip()
+            if text and text.lower() not in ("none", "null", "0", ""):
+                return text
+        for item in node.values():
+            hit = find(item, key)
+            if hit:
+                return hit
+        return None
 
-    walk(content)
-    return found
+    for key in keys:
+        hit = find(content, str(key))
+        if hit:
+            return hit
+    return None
 
 
 def _first_present_key(columns: set[str], candidates: Sequence[str]) -> str | None:
@@ -229,10 +393,18 @@ def _first_present_key(columns: set[str], candidates: Sequence[str]) -> str | No
 
 
 def _first_present(row: Any, keys: set[str], candidates: Sequence[str]) -> str | None:
-    """从一行里取第一个存在的候选列的值（统一成字符串）。"""
+    """从一行里取第一个**有意义**的候选列的值（统一成字符串）。
+
+    `0` 要当成"没有"：`"40003"` / `"40850"` 这类序号列的 0 表示"不适用"，
+    把它当成有效值会让每条消息都"看起来在回复第 0 条"（这个坑真踩到过 ——
+    400 条消息全都带上了引用关系）。
+    """
     for name in candidates:
-        if name in keys and row[name] is not None and str(row[name]).strip():
-            return str(row[name]).strip()
+        if name not in keys or row[name] is None:
+            continue
+        text = str(row[name]).strip()
+        if text and text.lower() not in ("0", "none", "null"):
+            return text
     return None
 
 
@@ -347,9 +519,18 @@ class SourceDatabase:
         with closing(self._connect()) as conn:
             if not self._columns:
                 self._columns = _column_names(conn, self._table)
-            select = [c for c in ("msg_id", "timestamp", *OPTIONAL_COLUMNS) if c in self._columns]
+            select = [
+                c
+                for c in ("msg_id", "timestamp", *OPTIONAL_COLUMNS, *_EXTRA_COLUMNS)
+                if c in self._columns
+            ]
+            # ⚠️ 列名**必须加引号**。`"40003"` / `"40850"` 这种纯数字列名不加引号会被
+            # SQLite 当成**数字字面量**（`SELECT 40850` 就是常量 40850），于是每一行
+            # 都"看起来"有这个值 —— 读取器当时读到的其实是 40850 这个数字，
+            # 而不是那一列的内容。
+            columns_sql = ", ".join('"' + c + '"' for c in select)
             sql = (
-                f'SELECT {", ".join(select)} FROM "{self._table}"'
+                f'SELECT {columns_sql} FROM "{self._table}"'
                 " WHERE (timestamp > ?) OR (timestamp = ? AND msg_id > ?)"
                 " ORDER BY timestamp ASC, msg_id ASC LIMIT ?"
             )
@@ -381,6 +562,10 @@ class SourceDatabase:
         # 它为空但 content 是纯文本段时，退回 content 里的 text。
         if not text and isinstance(content, dict) and content.get("type") == "text":
             text = str(content.get("text") or "")
+        # 引用目标：**先看表列**（`40850` = 被回复消息的群内序号）。
+        # 表列比正文里的字段可靠：字段文档统计过，`40850` 与 `40003` 的匹配率
+        # 99.88%，而正文里的 `47401` 只是"候选 ID"、`47422` 明确对不上主表。
+        quote = _first_present(row, keys, ("40850",)) or quote_ref_from_content(content)
         return SourceMessage(
             msg_id=str(row["msg_id"]),
             timestamp=int(row["timestamp"]),
@@ -391,7 +576,7 @@ class SourceDatabase:
             attachments=attachments_from_content(content),
             parse_status=str(row["parse_status"]) if "parse_status" in keys and row["parse_status"] else None,
             raw_content=content,
-            quote_ref=quote_ref_from_content(content),
+            quote_ref=quote,
             seq=_first_present(row, keys, SEQ_COLUMN_CANDIDATES),
         )
 
@@ -408,14 +593,15 @@ class SourceDatabase:
         with closing(self._connect()) as conn:
             if not self._columns:
                 self._columns = _column_names(conn, self._table)
-            select = [c for c in ("msg_id", "timestamp", *OPTIONAL_COLUMNS, "seq", *SEQ_COLUMN_CANDIDATES)
+            select = [c for c in ("msg_id", "timestamp", *OPTIONAL_COLUMNS, *_EXTRA_COLUMNS)
                       if c in self._columns]
             select = list(dict.fromkeys(select))  # 去重但保序
+            columns_sql = ", ".join('"' + c + '"' for c in select)  # 数字列名必须加引号
             for start in range(0, len(ids), 500):
                 chunk = ids[start : start + 500]
                 marks = ",".join("?" * len(chunk))
                 sql = (
-                    f'SELECT {", ".join(select)} FROM "{self._table}"'
+                    f'SELECT {columns_sql} FROM "{self._table}"'
                     f' WHERE msg_id IN ({marks})'
                 )
                 for row in conn.execute(sql, chunk).fetchall():
@@ -429,8 +615,11 @@ class SourceDatabase:
         这一列决定了「回复 → 被回复的那条」能不能**确定性地**解析出来。
         nt_msg_db_util 的字段文档说回复里的 `47402` 与群内序号匹配、而
         `47422` 与主表 `40001` 不匹配 —— 也就是说**没有这一列就拿不到被引用
-        消息的 msg_id**。当前 3.export.py 的 `group_messages` 里没有它，
-        所以这里如实返回 None，由上层把"识别不了补充关系"明确报出来。
+        消息的 msg_id**。
+
+        上游 3.export.py 的 `group_messages` 里没有它（所以读上游的库时这里如实
+        返回 None，由上层把"识别不了补充关系"明确报出来）；本客户端自己导出的库
+        （`app/ntmsg_db/export.py`）会带上 `"40003"`，于是补充关系能落到原任务上。
         """
         if not self._columns:
             with closing(self._connect()) as conn:
@@ -439,15 +628,27 @@ class SourceDatabase:
 
     def resolve_seq(self, group_id: str, seq_value: str) -> str | None:
         """把"群内序号"解析成那条消息的 msg_id。解析不了返回 None（**不猜**）。"""
+        return self.resolve_seq_detail(group_id, seq_value)[0]
+
+    def resolve_seq_detail(self, group_id: str, seq_value: str) -> tuple[str | None, int]:
+        """`(命中的 msg_id 或 None, 命中几条)`。
+
+        **命中多条时一定返回 None**：群内序号在真实数据里会被复用（实测 769,003 行
+        里有 21,129 个 `(群, 序号)` 组合对应不止一条消息 —— 合并/迁移过的历史里
+        序号会重复）。挑一条"看起来最像"的会把补充写到**别人的任务**上，
+        那比认不出来糟糕得多，所以宁可交回 None 让上层按新消息处理。
+        """
         column = self.seq_column()
         if not column:
-            return None
+            return None, 0
         with closing(self._connect()) as conn:
-            row = conn.execute(
-                f'SELECT msg_id FROM "{self._table}" WHERE group_id=? AND "{column}"=? LIMIT 1',
+            rows = conn.execute(
+                f'SELECT msg_id FROM "{self._table}" WHERE group_id=? AND "{column}"=? LIMIT 2',
                 (str(group_id), str(seq_value)),
-            ).fetchone()
-        return str(row["msg_id"]) if row else None
+            ).fetchall()
+        if len(rows) == 1:
+            return str(rows[0]["msg_id"]), 1
+        return None, len(rows)
 
     def iter_since(
         self, since_ts: int, since_msg_id: str = "", *, limit: int, chunk: int = 500

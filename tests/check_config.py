@@ -162,6 +162,21 @@ def main() -> int:  # noqa: C901
     check("UserToken 认出来了", Settings(client_token="xc_abc").is_user_token, True)
     check("服务令牌会被识别出来（启动时会警告）", Settings(client_token="service-token").is_user_token, False)
 
+    # ---- "只给一个 nt_msg.db" 那条路上的路径推导 ----
+    check("没配 CLIENT_NT_MSG_DB → 不起用解密/导出流水线",
+          Settings().ntmsg_pipeline_enabled, False)
+    check("没配时源库就是 CLIENT_DB_PATH",
+          Settings(client_db_path="/data/nt_msg_export.db").ntmsg_export_path.as_posix(),
+          "/data/nt_msg_export.db")
+    only_source = Settings(client_nt_msg_db="/data/nt_msg.db")
+    check("配了 nt_msg.db → 流水线启用", only_source.ntmsg_pipeline_enabled, True)
+    check("导出库默认放在 nt_msg.db 旁边（不用再配一个路径）",
+          only_source.ntmsg_export_path.as_posix(), "/data/nt_msg_export.db")
+    both = Settings(client_nt_msg_db="/data/nt_msg.db", client_db_path="/out/mine.db")
+    check("两个都配了 → 听 CLIENT_DB_PATH 的", both.ntmsg_export_path.as_posix(), "/out/mine.db")
+    check("镜像库跟着导出库走（换导出库 = 换一份状态，不会串）",
+          only_source.resolved_mirror_path.as_posix(), "/data/nt_msg_export.db.mirror.db")
+
     # ------------------------------------------------------------------
     print("\n--- 6. 白名单配置的派生判定 ---")
     check("留空 → 不限制", Settings().allows("999999999", "88888"), True)

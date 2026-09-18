@@ -6,3 +6,16 @@ pydantic-settings>=2.3,<3.0
 # 全年 UTC+8，所以结果是"碰巧对"，但日志里会一直刷警告，而用户配一个带夏令时的
 # 时区就会真的算错）。Linux/macOS 上它只是一个更保险的兜底。
 tzdata>=2024.1
+
+# 解密 nt_msg.db（只在配了 CLIENT_NT_MSG_DB 时才用得上）。
+#
+# 这是 `nt_msg_db_util` 的同一个库：官方 `sqlcipher3` 在 PyPI 上**只有 Windows 的
+# wheel**（cp312~cp314 win_amd64），Linux 上只有源码包（要现场编译 SQLCipher，
+# 又慢又要编译器）。`sqlcipher3-wheels` 是同一份代码的预编译再发布，**模块名一样
+# 是 `sqlcipher3`**，Linux 上有 cp312/cp313 的 manylinux wheel。
+# 所以按平台二选一 —— 两个都装会互相覆盖。
+sqlcipher3>=0.6.2; sys_platform == "win32"
+sqlcipher3-wheels>=0.5.5; sys_platform != "win32"
+
+# 解析 40800 里的消息体（`msgdb/proto/*_pb2.py` 是 protoc 生成的）。
+protobuf>=5.26
