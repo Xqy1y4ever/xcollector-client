@@ -234,10 +234,16 @@ class Settings(BaseSettings):
         用 `ntmsg_export_path` 而不是 `resolved_db_path`：走"只给 nt_msg.db"那条路时
         `CLIENT_DB_PATH` 可以是空的，那时导出库在 nt_msg.db 旁边，镜像也该在那儿（而且
         这样从"手动导出"切到"客户端自己导出"时，只要导出库路径没变，状态就还在）。
+
+        ⚠️ 输入**一个都没配**时给一个占位路径（`<仓库>/mirror.db`）而不是崩：
+        `--status` 与 Web UI 的第一件事就是显示"你还没配输入"，那时它们不该抛
+        `ValueError: WindowsPath('.') has an empty name`。
         """
         if self.client_mirror_path.strip():
             return Path(self.client_mirror_path).expanduser()
         source = self.ntmsg_export_path
+        if not source.name:
+            return BASE_DIR / "mirror.db"
         return source.with_name(source.name + ".mirror.db")
 
     @property

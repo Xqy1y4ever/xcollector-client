@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Xcollector 客户端</title>
+<!--
+  单文件页面：没有构建步骤、没有外部依赖（CDN 也不引 —— 这台机器可能上不了外网）。
+  轮询 /api/state 与 /api/log；所有写操作都带 X-XC-UI 头（见 server.py 的说明）。
+
+  它不是"更好看的命令行"，而是把最容易配错、最难看出来的三件事摆到台面上：
+    1. 配置对不对（令牌是不是用户令牌、源库在不在、白名单收窄了没有）；
+    2. 现在跑到哪了（还有多少条没读、上一轮做了什么、错误是什么）；
+    3. 点一下就真的跑起来（不用记 cron，也不用开着终端）。
+-->
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
+    --text: #e6e8ee; --dim: #98a0b3; --accent: #4c8dff; --ok: #3ecf8e;
+    --warn: #f0b429; --bad: #f2555a; --mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  header { padding: 18px 22px; border-bottom: 1px solid var(--line);
+           display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--dim); font-size: 12px; }
+  main { max-width: 1080px; margin: 0 auto; padding: 18px 22px 60px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+            padding: 16px 18px; margin-bottom: 16px; }
+  section > h2 { font-size: 14px; margin: 0 0 12px; color: var(--dim); font-weight: 600;
+                 letter-spacing: .04em; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 18px; }
+  .kv { display: flex; gap: 8px; align-items: baseline; }
+  .kv .k { color: var(--dim); min-width: 92px; }
+  .kv .v { font-family: var(--mono); word-break: break-all; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px;
+          background: var(--panel2); border: 1px solid var(--line); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .dim { color: var(--dim); }
+  button { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+           border-radius: 8px; padding: 7px 14px; font-size: 13px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.warnbtn { border-color: var(--warn); color: var(--warn); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+  .field label { font-size: 12px; color: var(--dim); font-family: var(--mono); }
+  .field input, .field select { background: var(--panel2); border: 1px solid var(--line);
+      color: var(--text); border-radius: 8px; padding: 7px 10px; font-family: var(--mono); font-size: 13px; }
+  .field .hint { font-size: 12px; color: var(--dim); }
+  details { border-top: 1px dashed var(--line); padding-top: 10px; margin-top: 10px; }
+  details > summary { cursor: pointer; color: var(--dim); font-size: 13px; }
+  pre.log { background: #0b0d11; border: 1px solid var(--line); border-radius: 8px;
+            padding: 10px 12px; height: 260px; overflow: auto; margin: 0;
+            font-family: var(--mono); font-size: 12px; white-space: pre-wrap; }
+  .logline .t { color: #6b7280; }
+  .logline .ERROR { color: var(--bad); } .logline .WARNING { color: var(--warn); }
+  .logline .INFO { color: var(--text); } .logline .DEBUG { color: var(--dim); }
+  .banner { border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; font-size: 13px;
+            border: 1px solid var(--line); background: var(--panel2); }
+  .banner.bad { border-color: var(--bad); color: #ffd9da; }
+  .banner.warn { border-color: var(--warn); color: #ffeccb; }
+  .cols2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 720px) { .cols2 { grid-template-columns: 1fr; } }
+  code { font-family: var(--mono); background: var(--panel2); padding: 1px 5px; border-radius: 5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Xcollector 客户端</h1>
+  <span class="sub" id="hdr">正在读取状态…</span>
+  <span style="flex:1"></span>
+  <span class="sub">本机工具 · 只监听 <code id="origin"></code></span>
+</header>
+
+<main>
+  <div id="banners"></div>
+
+  <!-- ============ 状态 ============ -->
+  <section>
+    <h2>现在是什么状态</h2>
+    <div class="grid" id="state"></div>
+  </section>
+
+  <!-- ============ 跑一轮 ============ -->
+  <section>
+    <h2>跑起来</h2>
+    <div class="row">
+      <button class="primary" id="run-once">▶ 跑一轮</button>
+      <button id="run-auto">🔁 自动跑（每 <span id="poll">?</span> 秒）</button>
+      <button class="warnbtn" id="stop">⏹ 停止</button>
+      <span class="dim" id="run-msg"></span>
+    </div>
+    <div id="last-report" class="dim" style="margin-top:10px"></div>
+  </section>
+
+  <!-- ============ 配置 ============ -->
+  <section>
+    <h2>配置（写进 .env）</h2>
+    <div class="dim" style="font-size:12px;margin-bottom:12px" id="env-path"></div>
+    <form id="config-form" autocomplete="off"></form>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" id="save">保存配置</button>
+      <button id="reload">放弃修改，重新读取</button>
+      <span class="dim" id="save-msg"></span>
+    </div>
+    <div id="unknown"></div>
+  </section>
+
+  <!-- ============ 日志 ============ -->
+  <section>
+    <h2>日志</h2>
+    <div class="row" style="margin-bottom:8px">
+      <label class="dim"><input type="checkbox" id="follow" checked> 自动滚到底</label>
+      <button id="clear-log">清屏（只是不清缓冲）</button>
+      <span class="dim" id="log-count"></span>
+    </div>
+    <pre class="log" id="log"></pre>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+// ---- 小工具 -------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmtTs = (ms) => (ms ? new Date(ms).toLocaleString() : "—");
+const bool = (v) => (v ? '<span class="ok">是</span>' : '<span class="bad">否</span>');
+
+async function api(path, options) {
+  const res = await fetch(path, { headers: { "X-XC-UI": "1" }, ...options });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}
+
+// ---- 配置表单：字段定义 ---------------------------------------------------
+// 每一项：键、标签、说明、（可选）下拉选项。**只列配置项**，其余都是代码里的常量。
+const FIELDS = [
+  { k: "BACKEND_BASE_URL", label: "后端地址", hint: "例：http://127.0.0.1:8000" },
+  { k: "CLIENT_TOKEN", label: "UserToken（xc_ 开头）", secret: true, hint: "留空 = 不改动。**必须是某个用户的 UserToken**，不是服务令牌" },
+  { k: "CLIENT_NT_MSG_DB", label: "加密的 nt_msg.db 路径", hint: "A 方案：给了它，客户端自己剥头+解密+导出" },
+  { k: "CLIENT_NT_MSG_KEY", label: "密钥（16 个字符）", secret: true, hint: "留空 = 不改动。更稳妥的做法是下面那个文件" },
+  { k: "CLIENT_NT_MSG_KEY_FILE", label: "或者：密钥文件路径", hint: "文件内容首尾空白会被去掉" },
+  { k: "CLIENT_DB_PATH", label: "或：现成的导出库路径", hint: "B 方案：nt_msg_export.db，此时上面两项留空" },
+  { k: "CLIENT_MIRROR_PATH", label: "镜像库路径", hint: "留空 = 放在源库旁边（<源库>.mirror.db）。**别删**：删了会重读整个库" },
+  { k: "CLIENT_GROUP_WHITELIST", label: "群白名单", hint: "只做收窄：留空 = 全都读。格式 号码:备注,号码" },
+  { k: "CLIENT_SENDER_WHITELIST", label: "发送者白名单", hint: "同上；两个是「同时满足」" },
+  { k: "CLIENT_ATTACHMENT_ROOT", label: "附件目录", hint: "NTQQ 的附件目录；配了才能找回图片真字节" },
+  { k: "CLIENT_EXTRACTOR", label: "抽取器", options: ["rule", "llm", "both"],
+    hint: "rule = 只用规则（不花钱，适合先跑通）/ llm = 只信模型 / both = 模型为主、规则兜底" },
+  { k: "LLM_API_BASE", label: "LLM 地址", hint: "用 llm / both 时才需要" },
+  { k: "LLM_MODEL", label: "LLM 模型名", hint: "" },
+  { k: "LLM_API_KEY", label: "LLM API Key", secret: true, hint: "留空 = 不改动" },
+  { k: "CLIENT_POLL_SECONDS", label: "轮询间隔（秒）", hint: "自动跑 / --loop 的间隔" },
+  { k: "CLIENT_LOG_LEVEL", label: "日志级别", options: ["DEBUG", "INFO", "WARNING", "ERROR"], hint: "" },
+  { k: "DIGEST_TZ", label: "时区", hint: "**必须和 bot / 后端一致**" },
+];
+
+let current = {};   // 最近一次从服务端读到的值
+
+function renderForm(cfg) {
+  current = cfg.values || {};
+  const secrets = new Set(cfg.secrets || []);
+  const override = new Set(cfg.env_override || []);
+  $("env-path").innerHTML = `文件：<code>${esc(cfg.path)}</code>` +
+    (cfg.exists === false ? " <span class='warn'>（还不存在，保存后会创建）</span>" : "");
+  $("config-form").innerHTML = FIELDS.map((f) => {
+    const value = current[f.k] ?? "";
+    const input = f.options
+      ? `<select data-key="${f.k}">${f.options.map((o) =>
+            `<option value="${o}"${o === value ? " selected" : ""}>${o}</option>`).join("")}</select>`
+      : `<input data-key="${f.k}" type="${f.secret ? "password" : "text"}" value="${esc(value)}"
+                placeholder="${f.secret && value === "" ? "（已设置，留空不改）" : ""}">`;
+    const note = override.has(f.k)
+      ? `<span class="warn">⚠️ 这个键在启动的环境变量里也有（环境变量优先，写文件不会生效）</span>` : "";
+    return `<div class="field"><label>${f.k} · ${esc(f.label)}</label>${input}
+            ${f.hint ? `<span class="hint">${f.hint}</span>` : ""}${note}</div>`;
+  }).join("");
+}
+
+function collectForm() {
+  const values = {};
+  document.querySelectorAll("#config-form [data-key]").forEach((el) => {
+    values[el.dataset.key] = el.value;
+  });
+  return values;
+}
+
+// ---- 状态渲染 -------------------------------------------------------------
+function renderState(s) {
+  const c = s.config || {}, src = s.source || {}, mir = s.mirror || {}, be = s.backend || {}, run = s.run || {};
+  const banners = [];
+  if (!be.reachable) {
+    banners.push(`<div class="banner bad">后端不可达：${esc(be.error || "")}
+      <br><span class="dim">先把后端跑起来，或检查配置里的 BACKEND_BASE_URL。</span></div>`);
+  } else if (c.token_is_user === false) {
+    banners.push(`<div class="banner warn">令牌不是 UserToken（scope=${esc(be.scope)}）。
+      用服务令牌跑客户端意味着它能读写<b>所有人</b>的数据，请换成某个用户的 UserToken。</div>`);
+  }
+  if (!c.pipeline && !c.source) {
+    banners.push(`<div class="banner warn">还没配输入：填 CLIENT_NT_MSG_DB（加密库）或 CLIENT_DB_PATH（现成的导出库）。</div>`);
+  }
+  if (src.ok === false) {
+    banners.push(`<div class="banner bad">源库读不了：${esc(src.error || "")}</div>`);
+  }
+  if (s.unknown_keys && s.unknown_keys.length) {
+    banners.push(`<div class="banner warn">.env 里有 ${s.unknown_keys.length} 个键<b>不是配置项</b>
+      （不会生效）：<code>${esc(s.unknown_keys.join(", "))}</code></div>`);
+  }
+  $("banners").innerHTML = banners.join("");
+
+  const unread = s.unread;
+  $("state").innerHTML = [
+    kv("后端", be.reachable
+      ? `<span class="ok">可达</span> · ${esc(be.qq || "")} (${esc(be.scope || "")})`
+      : `<span class="bad">不可达</span>`),
+    kv("源库", src.ok
+      ? `${esc(src.rows ?? "?")} 行 · 最新 ${esc(fmtTs((src.latest_ts || 0) * 1000))}`
+      : `<span class="bad">读不了</span>`),
+    kv("没读过的", unread == null ? "—" : `${unread} 条 <span class="dim">（一轮最多 ${c.max_per_cycle} 条）</span>`),
+    kv("镜像库", mir.error ? `<span class="bad">${esc(mir.error)}</span>`
+      : `共 ${mir.total ?? 0} 条 · ${esc(JSON.stringify(mir.by_state || {}))}` +
+        (mir.unfinished ? ` · <span class="warn">${mir.unfinished} 条没处理完</span>` : "")),
+    kv("本地白名单", c.whitelist_active
+      ? `群 ${(c.groups || []).length} 个 · 发送者 ${(c.senders || []).length} 个`
+      : `<span class="dim">没配：源库里所有来源都读</span>`),
+    kv("抽取器", esc(c.extractor || "") + (c.extractor === "rule" ? ` <span class="dim">（不花钱）</span>` : "")),
+    kv("输入方式", c.pipeline ? `nt_msg.db → 自己解密导出` : `现成的导出库`),
+    kv("运行中", run.busy
+      ? `<span class="ok">${esc(run.mode)}</span> · 已跑 ${run.cycles} 轮 · 起于 ${esc(fmtTs(run.started_at))}`
+      : `<span class="dim">空闲</span>`),
+  ].join("");
+  $("poll").textContent = c.poll_seconds ?? "?";
+
+  const r = run.last_report || {};
+  $("last-report").innerHTML = r.finished_at
+    ? `上一轮：扫了 ${r.scanned} 条（重试 ${r.recovered}）· 处理 ${r.processed} · ` +
+      `跳过 ${r.unchanged} 条已读过 / ${r.skipped_whitelist} 条白名单外 · ` +
+      `结果 ${esc(JSON.stringify(r.outcomes || {}))}` +
+      (r.errors && r.errors.length ? ` · <span class="bad">${r.errors.length} 个错误</span>` : "") +
+      (run.last_error ? ` · <span class="bad">${esc(run.last_error)}</span>` : "")
+    : `<span class="dim">这一轮还没跑过</span>`;
+
+  $("run-once").disabled = !!run.busy;
+  $("run-auto").disabled = !!run.busy;
+  $("stop").disabled = !run.busy;
+}
+
+function kv(k, v) { return `<div class="kv"><span class="k">${k}</span><span class="v">${v}</span></div>`; }
+
+// ---- 日志 -----------------------------------------------------------------
+let logSince = 0;
+function renderLog(lines) {
+  if (!lines.length) return;
+  const box = $("log");
+  for (const l of lines) {
+    logSince = Math.max(logSince, l.ts);
+    const div = document.createElement("div");
+    div.className = "logline";
+    div.innerHTML = `<span class="t">${new Date(l.ts).toLocaleTimeString()}</span> ` +
+      `<span class="${esc(l.level)}">${esc(l.level.padEnd(7))}</span> ${esc(l.text)}`;
+    box.appendChild(div);
+  }
+  while (box.childNodes.length > 500) box.removeChild(box.firstChild);
+  $("log-count").textContent = `共 ${box.childNodes.length} 行`;
+  if ($("follow").checked) box.scrollTop = box.scrollHeight;
+}
+
+// ---- 轮询 -----------------------------------------------------------------
+async function tick() {
+  try {
+    const [state, log] = await Promise.all([api("/api/state"), api(`/api/log?since=${logSince}`)]);
+    renderState(state);
+    renderLog(log.lines || []);
+    $("hdr").textContent = `已连接 · ${new Date().toLocaleTimeString()}`;
+  } catch (err) {
+    $("hdr").innerHTML = `<span class="bad">读不到状态：${esc(err.message)}</span>`;
+  }
+}
+
+async function loadConfig() {
+  const cfg = await api("/api/config");
+  renderForm(cfg);
+  const unknown = cfg.unknown_keys || [];
+  $("unknown").innerHTML = unknown.length
+    ? `<details><summary>有 ${unknown.length} 个键不是配置项（不会生效）：${esc(unknown.join(", "))}</summary>
+        <div class="row" style="margin-top:8px">
+          <button id="cleanup">把它们的行注释掉</button>
+          <span class="dim">注释而不是删除 —— 你还能自己看回来。</span>
+        </div></details>`
+    : "";
+  const btn = $("cleanup");
+  if (btn) btn.onclick = async () => {
+    const res = await api("/api/config/cleanup", {
+      method: "POST", headers: { "X-XC-UI": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ keys: unknown }),
+    });
+    $("save-msg").textContent = `已注释掉 ${res.touched.length} 行`;
+    await loadConfig();
+  };
+}
+
+// ---- 事件 -----------------------------------------------------------------
+$("save").onclick = async () => {
+  $("save-msg").textContent = "保存中…";
+  try {
+    const res = await api("/api/config", {
+      method: "POST", headers: { "X-XC-UI": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ values: collectForm() }),
+    });
+    $("save-msg").innerHTML = `<span class="ok">已保存</span> ${esc((res.saved || []).join(", ") || "（没有变化）")}`;
+    await loadConfig();
+    await tick();
+  } catch (err) {
+    $("save-msg").innerHTML = `<span class="bad">保存失败：${esc(err.message)}</span>`;
+  }
+};
+
+$("reload").onclick = () => loadConfig().then(() => { $("save-msg").textContent = "已重新读取"; });
+
+async function run(mode) {
+  $("run-msg").textContent = "启动中…";
+  try {
+    const res = await api("/api/run", {
+      method: "POST", headers: { "X-XC-UI": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+    $("run-msg").textContent = res.message || "已启动";
+  } catch (err) {
+    $("run-msg").innerHTML = `<span class="bad">${esc(err.message)}</span>`;
+  }
+  await tick();
+}
+$("run-once").onclick = () => run("once");
+$("run-auto").onclick = () => run("auto");
+$("stop").onclick = async () => {
+  const res = await api("/api/stop", {
+    method: "POST", headers: { "X-XC-UI": "1", "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  $("run-msg").textContent = res.message;
+  await tick();
+};
+$("clear-log").onclick = () => { $("log").innerHTML = ""; $("log-count").textContent = ""; };
+
+$("origin").textContent = location.host;
+loadConfig().catch((e) => { $("save-msg").innerHTML = `<span class="bad">配置读不出来：${esc(e.message)}</span>`; });
+tick();
+setInterval(tick, 1500);
+</script>
+</body>
+</html>

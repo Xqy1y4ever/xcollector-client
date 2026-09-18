@@ -48,7 +48,41 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-完整说明见 [`.env.example`](.env.example)（第 3 节讲 A 方案）。最少要配：
+**或者用自带的 Web UI 填**（推荐第一次用）：
+
+```bash
+python -m app.main --ui           # 然后浏览器打开 http://127.0.0.1:8787
+```
+
+页面上能填配置、点"跑一轮"、看实时日志，还会把"令牌不是 UserToken""源库读不了"
+".env 里有 N 个键已经失效"这些一眼看不出来的问题直接摆出来。它**只监听 127.0.0.1**，
+**零新依赖**（标准库 + 一个静态页，不需要构建）。
+
+```
+┌─ Xcollector 客户端 ─────────────────────────────────────────────┐
+│ 后端         可达 · 5078xxxxx (user)    没读过的     12 条      │
+│ 源库         774,574 行                 镜像库     共 812 条    │
+│ 本地白名单   群 3 个 · 发送者 2 个      运行中     空闲         │
+├─────────────────────────────────────────────────────────────────┤
+│ [▶ 跑一轮]  [🔁 自动跑（每 300 秒）]  [⏹ 停止]                  │
+├─────────────────────────────────────────────────────────────────┤
+│ BACKEND_BASE_URL  http://127.0.0.1:8000                          │
+│ CLIENT_TOKEN      （已设置，留空不改）                           │
+│ CLIENT_NT_MSG_DB  C:\Users\me\...\nt_db\nt_msg.db                │
+│ ...                                                              │
+│                            [保存配置]                            │
+├─────────────────────────────────────────────────────────────────┤
+│ 12:01:03 INFO  源库准备：解密：… ；导出：写入 774,574 行         │
+│ 12:01:52 INFO  本轮：扫了 12 条，…                               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+写的是同一个 `.env`（`cp .env.example .env` 那一步可以跳过，页面上保存就会创建）。
+写文件时**只改配置项那几行**，你的注释、空行、老键都原样留着；不生效的老键它会
+列出来问你要不要注释掉（注释，不是删）。
+
+完整说明见 [`.env.example`](.env.example)（第 2 节讲两种输入方案）。
+不想用页面的话，手工最少要配这些：
 
 ```env
 # 1) 身份：某个用户的 UserToken（不是服务令牌 API_TOKEN）
@@ -67,16 +101,21 @@ BACKEND_BASE_URL=http://127.0.0.1:8000
 两个都配了则听 `CLIENT_DB_PATH` 的。密钥也可以放文件里（更稳妥）：
 `CLIENT_NT_MSG_KEY_FILE=/path/to/key.txt`，内容首尾空白会被自动去掉。
 
-常用项：
+全部配置项（一共 17 个）：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
+| `BACKEND_BASE_URL` | `http://127.0.0.1:8000` | 后端地址 |
+| `CLIENT_TOKEN` | 空 | 某个用户的 UserToken（`xc_` 开头） |
+| `CLIENT_NT_MSG_DB` | 空 | A 方案：加密的 `nt_msg.db` |
+| `CLIENT_NT_MSG_KEY` / `CLIENT_NT_MSG_KEY_FILE` | 空 | 上面那个库的密钥（值或文件，推荐文件） |
+| `CLIENT_DB_PATH` | 空 | B 方案：现成的导出库 |
+| `CLIENT_MIRROR_PATH` | 源库旁边 | 客户端自己的状态库（"哪些读过了"）。**别删**，删了会把整个源库重读一遍 |
+| `CLIENT_GROUP_WHITELIST` / `CLIENT_SENDER_WHITELIST` | 空 | **只做收窄，不做开关**：留空 = 全都读（客户端不看后端订阅）。格式与 bot 相同 |
+| `CLIENT_ATTACHMENT_ROOT` | 空 | NTQQ 附件目录，按 md5/文件名找回真实字节并上传 |
 | `CLIENT_EXTRACTOR` | `rule` | `rule`（不花钱）/ `llm` / `both` |
 | `LLM_API_BASE` / `LLM_MODEL` / `LLM_API_KEY` | DeepSeek | `CLIENT_EXTRACTOR` 用 `llm`/`both` 时才需要 |
-| `CLIENT_GROUP_WHITELIST` / `CLIENT_SENDER_WHITELIST` | 空 | **只做收窄，不做开关**：留空 = 全都读（客户端不看后端订阅）。格式与 bot 相同 |
-| `CLIENT_MIRROR_PATH` | 源库旁边 | 客户端自己的状态库（"哪些读过了"）。**别删**，删了会把整个源库重读一遍 |
-| `CLIENT_ATTACHMENT_ROOT` | 空 | NTQQ 附件目录，按 md5/文件名找回真实字节并上传 |
-| `CLIENT_POLL_SECONDS` | `300` | `--loop` 的轮询间隔 |
+| `CLIENT_POLL_SECONDS` | `300` | `--loop` / 页面"自动跑"的间隔 |
 | `CLIENT_LOG_LEVEL` | `INFO` | 日志级别 |
 | `DIGEST_TZ` | `Asia/Shanghai` | **必须和 bot / 后端一致** |
 
@@ -99,9 +138,10 @@ BACKEND_BASE_URL=http://127.0.0.1:8000
 
 ### 跑
 
-只有三种跑法：
+四种跑法：
 
 ```bash
+python -m app.main --ui       # 本机 Web UI：配置 / 跑一轮 / 看日志（http://127.0.0.1:8787）
 python -m app.main --status   # 只看配置、源库、镜像、还有多少没读过、身份。**不写任何东西**
 python -m app.main --once     # 跑一轮就退出（推荐配合计划任务）
 python -m app.main --loop     # 常驻，按 CLIENT_POLL_SECONDS 定期跑
@@ -110,6 +150,10 @@ python -m app.main --loop     # 常驻，按 CLIENT_POLL_SECONDS 定期跑
 `--once` / `--loop` 会**先确保源库是最新的**：`nt_msg.db` 比明文库新就重新解密、
 明文库比导出库新就重新导出（只 `stat` 两次文件时间，不要钱）。想看解密的细节就
 看那一轮的日志（第一行「源库准备：…」）。
+
+`--ui` 的额外参数：`--host`（默认 `127.0.0.1`，**别改成对外地址**）、`--port`、`--no-browser`。
+它和 `--once` 是同一个进程里的两种用法：页面上点"跑一轮"就是后台跑 `--once` 那套逻辑，
+点"自动跑"就是 `--loop` 那套逻辑（间隔取 `CLIENT_POLL_SECONDS`）。
 
 **推荐 `--once` + 计划任务**：这个客户端本来就是批处理的，把调度交给操作系统
 比让它常驻更省心。

@@ -312,6 +312,15 @@ class SourceDatabase:
     # ---------------- 打开与自检 ----------------
 
     def _connect(self) -> sqlite3.Connection:
+        if not self.path.name or self.path.is_dir():
+            # 一个都没配时 `Path("")` 就是当前目录：说清楚该怎么配，
+            # 而不是让 sqlite 抛一句 "unable to open database file"。
+            raise SourceDatabaseError(
+                f"源库不是一个文件：{self.path}。请二选一：\n"
+                "  · CLIENT_NT_MSG_DB = 加密的 nt_msg.db 路径（+ CLIENT_NT_MSG_KEY），"
+                "客户端自己剥头、解密、导出；\n"
+                "  · CLIENT_DB_PATH  = 现成的 nt_msg_export.db 路径。"
+            )
         if not self.path.exists():
             raise SourceDatabaseError(
                 f"源库不存在：{self.path}。请先用 nt_msg_db_util 的 3.export.py "

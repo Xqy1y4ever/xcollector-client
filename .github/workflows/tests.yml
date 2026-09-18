@@ -37,7 +37,7 @@ jobs:
       - name: 源库读取器
         run: python -m tests.check_source_db
 
-      - name: 镜像库状态机（增量与"内容变了"的判据）
+      - name: 镜像库状态机（判据是"读没读过"）
         run: python -m tests.check_mirror
 
       - name: 白名单（只收窄、号码校验、改了立刻生效）
@@ -54,3 +54,9 @@ jobs:
       # 它不需要网络，也不需要 sqlcipher3。
       - name: nt_msg.db 解密与导出（SQLCipher 页格式 / wire / 导出）
         run: python -m tests.check_ntmsg_db
+
+      # Web UI 是**唯一会写用户 .env 的东西**：这里验的就是"只改配置项那几行"、
+      # "密钥不回显"、"不带 X-XC-UI 的 POST 一律 403"。真起一个服务（随机端口），
+      # 但仍然不联网、不需要后端。
+      - name: 本地 Web UI（.env 读写 + HTTP 接口）
+        run: python -m tests.check_webui

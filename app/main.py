@@ -1,14 +1,15 @@
 """入口：`python -m app.main`（或用 `.bat` / systemd timer / 计划任务）。
 
-## 三种跑法
+## 四种跑法
 
+    python -m app.main --ui       # 本机 Web UI：配置 / 跑一轮 / 看日志（推荐第一次用）
     python -m app.main --once     # 跑一轮就退出（**推荐**：交给 cron / 计划任务）
     python -m app.main --loop     # 常驻，按 CLIENT_POLL_SECONDS 定期跑
     python -m app.main --status   # 只看配置、源库、镜像、身份，不写任何东西
 
 **推荐用 `--once` + 计划任务**：这个客户端本来就是批处理的，把调度交给操作系统
 比让它常驻更省心（也不会有"进程活着但其实卡住了"这种最难发现的故障）。
-`--loop` 只是给不方便配计划任务的人一个选择。
+`--loop` 只是给不方便配计划任务的人一个选择，`--ui` 是给"想点着用"的人。
 
 （以前还有 `--prepare` / `--dry-run` / `--since-hours` / `--limit` / `--log-level`。
 它们都去掉了：前两个是"多看一步"的辅助模式，实际上没人用；后三个是把写死的常量
@@ -59,6 +60,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--once", action="store_true", help="只跑一轮就退出（推荐配合计划任务）")
     mode.add_argument("--loop", action="store_true", help="常驻，按 CLIENT_POLL_SECONDS 定期跑")
     mode.add_argument("--status", action="store_true", help="只做自检与统计，不写任何东西")
+    mode.add_argument(
+        "--ui",
+        action="store_true",
+        help="打开本机 Web UI（配置 / 跑一轮 / 看日志），默认 http://127.0.0.1:8787",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="--ui 监听地址（默认只监听本机）")
+    parser.add_argument("--port", type=int, default=8787, help="--ui 监听端口")
+    parser.add_argument("--no-browser", action="store_true", help="--ui 不要自动开浏览器")
     return parser.parse_args(argv)
 
 
@@ -176,29 +185,46 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
     return 0
 
 
-async def run_once(backend: BackendClient, settings) -> int:
-    """跑一轮：先确保源库是最新的（解密 + 导出），再入库。"""
+def _run_one_cycle(settings):
+    """跑一轮（含"先把源库准备好"），返回 `CycleReport`。
+
+    抽出来是因为 Web UI 也要用同一套：它在自己的线程里调这个函数，
+    所以这里**不能**有 print / 退出码之类的东西，一切进日志和返回值。
+    """
     from .ntmsg_db import prepare_databases
     from .ntmsg_db.decrypt import DecryptError
     from .ntmsg_db.export import ExportError
 
     prepared = None
     if settings.ntmsg_pipeline_enabled:
-        try:
-            prepared = prepare_databases(settings)
-        except (DecryptError, ExportError) as exc:
-            logger.error("准备源库失败：%s", exc)
-            return 2
+        prepared = prepare_databases(settings)
     db = SourceDatabase(prepared.export_path if prepared else settings.resolved_db_path)
+    db.inspect()   # 库不对就地抛 SourceDatabaseError，由调用方决定怎么说
+
+    backend = BackendClient(settings)
     try:
-        db.inspect()
+        return asyncio.run(
+            run_cycle(
+                backend,
+                settings,
+                db=db,
+                resolver=AttachmentResolver(settings.resolved_attachment_root),
+            )
+        )
+    finally:
+        asyncio.run(backend.close())
+
+
+async def run_once(backend: BackendClient, settings) -> int:
+    """`--once`：跑一轮，打完日志就退出。"""
+    try:
+        report = _run_one_cycle(settings)
     except SourceDatabaseError as exc:
         logger.error("%s", exc)
         return 2
-
-    report = await run_cycle(
-        backend, settings, db=db, resolver=AttachmentResolver(settings.resolved_attachment_root)
-    )
+    except (DecryptError, ExportError) as exc:
+        logger.error("准备源库失败：%s", exc)
+        return 2
     log_report(report)
     # 一条都没处理成功、而且有错 → 用非零退出码，让计划任务/监控能发现
     if report.errors and report.processed == 0 and report.scanned > 0:
@@ -208,6 +234,16 @@ async def run_once(backend: BackendClient, settings) -> int:
 
 async def amain(args: argparse.Namespace) -> int:
     settings = get_settings()
+
+    # Web UI 放在所有配置校验**之前**：第一次用的人手上什么都没有（.env 还没写、
+    # 源库还没配），而那个页面正是用来填这些的。挡住它的检查应该在页面**里面**做。
+    if args.ui:
+        from .webui import serve
+
+        return await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: serve(args.host, args.port, open_browser=not args.no_browser),
+        )
 
     if not settings.backend_base_url:
         logger.error("没有配置 BACKEND_BASE_URL")

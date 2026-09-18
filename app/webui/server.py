@@ -1,0 +1,485 @@
+"""Web UI 的 HTTP 服务：标准库 `http.server` + 一个静态页面，**零新依赖**。
+
+## 接口
+
+    GET  /                 页面（内嵌 CSS/JS 的单个 HTML）
+    GET  /api/state        一次拿全：配置摘要、源库、镜像、未读、后端身份、运行状态
+    GET  /api/config       当前 `.env` 的值（密钥类抹空）+ 不是配置项的键
+    POST /api/config       写 `.env`（只写配置项；密钥留空 = 不改）
+    POST /api/config/cleanup  把不是配置项的键注释掉
+    POST /api/run          跑一轮（mode=once）或开始自动跑（mode=auto）
+    POST /api/stop         停止自动跑（正在跑的那一轮做完了就停）
+    GET  /api/log          最近的日志（内存里留最后 N 条）
+
+页面用轮询（1.5s）而不是 SSE/WebSocket：逻辑少、断了也能自己恢复，
+而这个页面的量级本来就不需要推送。
+
+## 线程模型（为什么这么写）
+
+`http.server` 是阻塞式多线程；而 `run_cycle` 是 `asyncio` 的。硬要在请求线程里
+`asyncio.run()` 会让"跑一轮"挡住其它请求（页面就转圈、日志也刷不出来）。
+所以：**每个请求一个线程**（`ThreadingHTTPServer`），入库跑在**自己的 worker 线程**
+（那里面 `asyncio.run(...)`），主线程只读它的状态快照。一把锁保护"有没有在跑"。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import threading
+import time
+import webbrowser
+from dataclasses import dataclass, field
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+from ..backend_client import BackendClient, BackendError
+from ..config import MAX_MESSAGES_PER_CYCLE, get_settings, unknown_env_keys
+from ..mirror import Mirror
+from ..run import verify_identity
+from ..source.ntmsg import SourceDatabase, SourceDatabaseError
+from ..utils import now_ms
+from .envfile import (
+    SECRET_KEYS,
+    comment_out_keys,
+    config_values,
+    env_override_keys,
+    env_path,
+    read_env,
+    write_env_values,
+)
+
+logger = logging.getLogger(__name__)
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+LOG_BUFFER = 500
+UI_HEADER = "X-XC-UI"
+
+
+# ---------------------------------------------------------------------------
+# 日志环形缓冲（给页面上的"日志"面板用）
+# ---------------------------------------------------------------------------
+
+
+class _RingHandler(logging.Handler):
+    def __init__(self, size: int = LOG_BUFFER) -> None:
+        super().__init__(level=logging.DEBUG)
+        self._lines: list[dict] = []
+        self._lock = threading.Lock()
+        self._size = size
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            text = record.getMessage()
+        except Exception:  # noqa: BLE001 - 日志本身不许把程序搞崩
+            text = "<格式化失败>"
+        if record.exc_info:
+            text += " | " + logging.Formatter().formatException(record.exc_info).strip()
+        item = {
+            "ts": int(record.created * 1000),
+            "level": record.levelname,
+            "name": record.name,
+            "text": text,
+        }
+        with self._lock:
+            self._lines.append(item)
+            if len(self._lines) > self._size:
+                del self._lines[: len(self._lines) - self._size]
+
+    def tail(self, since_ts: int = 0) -> list[dict]:
+        with self._lock:
+            return [item for item in self._lines if item["ts"] > since_ts]
+
+
+def install_log_buffer() -> _RingHandler:
+    """把环形缓冲挂到根 logger（只挂一次）。"""
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if isinstance(handler, _RingHandler):
+            return handler
+    handler = _RingHandler()
+    root.addHandler(handler)
+    return handler
+
+
+# ---------------------------------------------------------------------------
+# 运行控制（worker 线程 + 一次一个）
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Runner:
+    """入库的运行状态。**一次只允许一件事在跑**（once 或 auto）。"""
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    mode: str = "idle"            # idle | once | auto
+    started_at: int = 0
+    cycles: int = 0
+    stop_requested: bool = False
+    last_report: dict = field(default_factory=dict)
+    last_error: str = ""
+    thread: threading.Thread | None = None
+
+    # 用不可变快照跨线程读状态：页面永远看到的是自洽的一组值
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "mode": self.mode,
+                "started_at": self.started_at,
+                "cycles": self.cycles,
+                "stop_requested": self.stop_requested,
+                "busy": self.mode != "idle",
+                "last_report": dict(self.last_report),
+                "last_error": self.last_error,
+            }
+
+    def _set(self, **fields: Any) -> None:
+        with self.lock:
+            for key, value in fields.items():
+                setattr(self, key, value)
+
+
+RUNNER = Runner()
+
+
+def _report_dict(report) -> dict:
+    return {
+        "scanned": report.scanned,
+        "processed": report.processed,
+        "unchanged": report.unchanged,
+        "recovered": report.recovered,
+        "skipped_whitelist": report.skipped_whitelist,
+        "reopened": report.reopened,
+        "unread_before": report.unread_before,
+        "outcomes": report.outcomes or {},
+        "errors": list(report.errors[:10]),
+        "prepared": report.prepared,
+        "mirror_after": report.mirror_after or {},
+        "finished_at": now_ms(),
+    }
+
+
+def _run_cycle_sync(mode: str) -> None:
+    """worker 线程里跑（`asyncio.run` 自己的事件循环）。"""
+    from ..main import _run_one_cycle  # 延迟导入：避免 main ↔ webui 的环
+
+    settings = get_settings()
+    interval = max(5, int(settings.client_poll_seconds))
+    try:
+        while True:
+            try:
+                report = _run_one_cycle(settings)
+                RUNNER._set(last_report=_report_dict(report), last_error="")
+                logging.getLogger("xcollector.webui").info(
+                    "跑完一轮：扫了 %d 条，处理 %d 条，错误 %d 条",
+                    report.scanned,
+                    report.processed,
+                    len(report.errors),
+                )
+            except Exception as exc:  # 单轮失败不能把自动模式打死
+                RUNNER._set(last_error=f"{type(exc).__name__}: {exc}")
+                logging.getLogger("xcollector.webui").exception("这一轮失败：%s", exc)
+            RUNNER._set(cycles=RUNNER.cycles + 1)
+            if mode == "once" or RUNNER.stop_requested:
+                break
+            # 自动模式：按 CLIENT_POLL_SECONDS 等下一轮，期间可以被打断
+            deadline = time.monotonic() + interval
+            while time.monotonic() < deadline:
+                if RUNNER.stop_requested:
+                    break
+                time.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
+            if RUNNER.stop_requested:
+                break
+    finally:
+        RUNNER._set(mode="idle", stop_requested=False, thread=None)
+
+
+def _invalidate_state_cache() -> None:
+    """状态变了就丢掉缓存（不然页面会拿着 3 秒前的快照说"没在跑"）。"""
+    _STATE_CACHE.update(at=0, value=None)
+
+
+def start_run(mode: str) -> tuple[bool, str]:
+    """启动一次运行。返回 `(是否启动, 说明)`。"""
+    with RUNNER.lock:
+        if RUNNER.mode != "idle":
+            return False, f"已经在跑（{RUNNER.mode}），先停掉再来"
+        RUNNER.mode = mode
+        RUNNER.started_at = now_ms()
+        RUNNER.stop_requested = False
+        RUNNER.last_error = ""
+        thread = threading.Thread(target=_run_cycle_sync, args=(mode,), daemon=True)
+        RUNNER.thread = thread
+    thread.start()
+    _invalidate_state_cache()
+    return True, f"已开始（{mode}）"
+
+
+def stop_run() -> str:
+    """请求停止。正在跑的那一轮**不会被中断**（它最多 500 条）。"""
+    with RUNNER.lock:
+        if RUNNER.mode == "idle":
+            return "现在没在跑"
+        RUNNER.stop_requested = True
+        mode = RUNNER.mode
+    _invalidate_state_cache()
+    return f"已请求停止（{mode}）：当前这一轮跑完就停"
+
+
+# ---------------------------------------------------------------------------
+# 状态快照
+# ---------------------------------------------------------------------------
+
+
+async def _collect_state() -> dict:
+    settings = get_settings()
+    state: dict[str, Any] = {
+        "config": {
+            "backend_base": settings.backend_base,
+            "token_is_user": settings.is_user_token,
+            "source": str(settings.ntmsg_export_path),
+            "mirror": str(settings.resolved_mirror_path),
+            "extractor": settings.client_extractor,
+            "whitelist_active": settings.whitelist_active,
+            "groups": sorted(settings.group_whitelist_map),
+            "senders": sorted(settings.sender_whitelist_map),
+            "poll_seconds": settings.client_poll_seconds,
+            "pipeline": settings.ntmsg_pipeline_enabled,
+            "attachment_root": str(settings.resolved_attachment_root or ""),
+            "max_per_cycle": MAX_MESSAGES_PER_CYCLE,
+        },
+        "env": {"path": str(env_path()), "exists": env_path().exists()},
+        "unknown_keys": unknown_env_keys(),
+    }
+
+    db = SourceDatabase(settings.ntmsg_export_path)
+    try:
+        info = db.inspect()
+        state["source"] = {
+            "ok": True,
+            "path": str(settings.ntmsg_export_path),
+            "rows": info["rows"],
+            "absent": info["absent"],
+            "latest_ts": (db.latest() or [None])[0],
+        }
+    except SourceDatabaseError as exc:
+        state["source"] = {"ok": False, "path": str(settings.ntmsg_export_path), "error": str(exc)}
+
+    mirror = Mirror(settings.resolved_mirror_path)
+    try:
+        stats = mirror.stats()
+        state["mirror"] = {
+            "path": str(settings.resolved_mirror_path),
+            **stats,
+            "unfinished": len(mirror.unfinished()),
+            "watermark": mirror.watermark(),
+        }
+    except Exception as exc:  # noqa: BLE001 - 状态页不该因为镜像坏了就打不开
+        state["mirror"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    if state["source"].get("ok"):
+        try:
+            state["unread"] = db.count_unread(settings.resolved_mirror_path)
+        except SourceDatabaseError as exc:
+            state["unread"] = None
+            state["source"]["unread_error"] = str(exc)
+
+    backend = BackendClient(settings)
+    try:
+        who = await verify_identity(backend, settings)
+        state["backend"] = {
+            "reachable": True,
+            "scope": who.get("scope"),
+            "qq": (who.get("user") or {}).get("qq"),
+            "user_id": (who.get("user") or {}).get("id"),
+        }
+    except Exception as exc:  # noqa: BLE001 - 后端不可达是常见状态，页面要照常打开
+        state["backend"] = {"reachable": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        await backend.close()
+
+    state["run"] = RUNNER.snapshot()
+    return state
+
+
+# 状态缓存：页面每 1.5 秒轮询一次，但**没必要每次都去问后端**（那会变成一台机器上
+# 每秒几百毫秒的无效请求）。缓存 3 秒，同时保证"刚点完跑一轮"能看到最新结果。
+_STATE_CACHE: dict[str, Any] = {"at": 0, "value": None}
+_STATE_CACHE_SECONDS = 3.0
+
+
+def collect_state(*, fresh: bool = False) -> dict:
+    now = time.monotonic()
+    if not fresh and _STATE_CACHE["value"] is not None and now - _STATE_CACHE["at"] < _STATE_CACHE_SECONDS:
+        return _STATE_CACHE["value"]
+    value = asyncio.run(_collect_state())
+    _STATE_CACHE.update(at=now, value=value)
+    return value
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "xcollector-client-ui"
+    protocol_version = "HTTP/1.1"
+
+    # ---- 基础 ----
+
+    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003 - 覆盖父类
+        logger.debug("ui %s - %s", self.address_string(), fmt % args)
+
+    def _send(self, status: int, body: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        # 本机工具：不许被别的站点嵌进 iframe，也不给任何 CORS 放行
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, payload: Any, status: int = 200) -> None:
+        self._send(status, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                   "application/json; charset=utf-8")
+
+    def _error(self, message: str, status: int = 400) -> None:
+        self._json({"error": message}, status)
+
+    def _read_json(self) -> dict:
+        """读请求体。**要求 `X-XC-UI` 头**（跨站请求发不出来，见模块说明）。"""
+        if self.headers.get(UI_HEADER) != "1":
+            raise PermissionError(f"缺少 {UI_HEADER} 头：这个接口只给自带的页面用")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return {}
+        if length > 1_000_000:
+            raise ValueError("请求体太大")
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"请求体不是 JSON：{exc}") from exc
+        return body if isinstance(body, dict) else {}
+
+    # ---- 路由 ----
+
+    def do_GET(self) -> None:  # noqa: N802 - 父类约定
+        path = self.path.split("?", 1)[0]
+        try:
+            if path in ("/", "/index.html"):
+                return self._static("index.html")
+            if path == "/api/state":
+                return self._json(collect_state())
+            if path == "/api/config":
+                return self._json({
+                    "values": config_values(),
+                    "secrets": list(SECRET_KEYS),
+                    "path": str(env_path()),
+                    "unknown_keys": unknown_env_keys(),
+                    # 进程环境变量优先级**高于** .env：写进文件也不会生效的那些键
+                    "env_override": env_override_keys(),
+                })
+            if path == "/api/log":
+                since = 0
+                if "?" in self.path:
+                    for part in self.path.split("?", 1)[1].split("&"):
+                        if part.startswith("since="):
+                            since = int(part[6:] or 0)
+                return self._json({"lines": LOG_BUFFER_HANDLER.tail(since)})
+            return self._error("没有这个接口", HTTPStatus.NOT_FOUND)
+        except Exception as exc:  # noqa: BLE001 - 页面要能看到错误，而不是白屏
+            logger.exception("UI GET %s 失败", path)
+            return self._error(f"{type(exc).__name__}: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def do_POST(self) -> None:  # noqa: N802 - 父类约定
+        path = self.path.split("?", 1)[0]
+        try:
+            body = self._read_json()
+        except PermissionError as exc:
+            return self._error(str(exc), HTTPStatus.FORBIDDEN)
+        except ValueError as exc:
+            return self._error(str(exc), HTTPStatus.BAD_REQUEST)
+
+        try:
+            if path == "/api/config":
+                values = {k: v for k, v in (body.get("values") or {}).items()}
+                # 密钥留空 = 不改动（页面上永远显示空，不能因此把它清掉）
+                for key in SECRET_KEYS:
+                    if key in values and not str(values[key] or "").strip():
+                        values.pop(key)
+                saved = write_env_values(values)
+                get_settings.cache_clear()   # 下一次运行就用新配置
+                _invalidate_state_cache()
+                logger.info("配置已保存：%s", ", ".join(saved) or "（没有变化）")
+                return self._json({"saved": saved, "unknown_keys": unknown_env_keys()})
+            if path == "/api/config/cleanup":
+                touched = comment_out_keys(body.get("keys") or unknown_env_keys())
+                logger.info("把不是配置项的键注释掉了：%s", ", ".join(touched) or "（没有）")
+                return self._json({"touched": touched, "unknown_keys": unknown_env_keys()})
+            if path == "/api/run":
+                mode = str(body.get("mode") or "once")
+                if mode not in ("once", "auto"):
+                    return self._error("mode 只能是 once / auto")
+                started, message = start_run(mode)
+                return self._json({"started": started, "message": message}, 200 if started else 409)
+            if path == "/api/stop":
+                return self._json({"message": stop_run()})
+            return self._error("没有这个接口", HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            return self._error(str(exc), HTTPStatus.BAD_REQUEST)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("UI POST %s 失败", path)
+            return self._error(f"{type(exc).__name__}: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    # ---- 静态 ----
+
+    def _static(self, name: str) -> None:
+        target = (STATIC_DIR / name).resolve()
+        if not str(target).startswith(str(STATIC_DIR)) or not target.exists():
+            return self._error("没有这个文件", HTTPStatus.NOT_FOUND)
+        suffix = target.suffix.lower()
+        ctype = {
+            ".html": "text/html; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+            ".js": "application/javascript; charset=utf-8",
+        }.get(suffix, "application/octet-stream")
+        self._send(HTTPStatus.OK, target.read_bytes(), ctype)
+
+
+LOG_BUFFER_HANDLER = install_log_buffer()
+
+
+def serve(host: str = "127.0.0.1", port: int = 8787, *, open_browser: bool = True) -> int:
+    """启动 Web UI（阻塞）。返回进程退出码。"""
+    loopback = host in ("127.0.0.1", "localhost", "::1")
+    if not loopback:
+        logger.warning(
+            "⚠️ Web UI 绑在 %s（不是 127.0.0.1）：这个页面能读到你的令牌、改配置、"
+            "触发入库，而且**没有鉴权**。除本机以外的任何地址都不该这么用。",
+            host,
+        )
+    if not read_env() and not env_path().exists():
+        logger.info("还没有 .env：页面上填完保存就行（会写到 %s）", env_path())
+
+    httpd = ThreadingHTTPServer((host, port), Handler)
+    httpd.daemon_threads = True
+    url = f"http://{host if loopback else host}:{port}/"
+    print(f"Xcollector 客户端 Web UI: {url}")
+    print("  配置、跑一轮、看日志都在这个页面里。Ctrl+C 退出。")
+    if open_browser and loopback:
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001 - 打不开浏览器不影响服务
+            logger.debug("打不开浏览器，手动访问 %s 即可", url)
+    try:
+        httpd.serve_forever(poll_interval=0.3)
+    except KeyboardInterrupt:
+        print("\n收到中断，服务退出（正在跑的那一轮会被放弃）")
+    finally:
+        httpd.server_close()
+    return 0
