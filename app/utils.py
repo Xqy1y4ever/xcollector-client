@@ -79,19 +79,12 @@ def parse_iso_to_ms(value: Any) -> int | None:
 def preview(text: Any, limit: int | None = None) -> str:
     """把文本压成一行、截断，供日志使用（日志里打印整条消息没有意义）。
 
-    `limit` 省略时取 `CLIENT_LOG_PREVIEW_CHARS`。**这个配置必须真的被读** ——
-    一个"配了但没人用"的开关比没有更糟：用户以为他调过了。
-
-    这里延迟导入 config：`utils` 被 config 之外的很多模块引用，模块级导入会绕成
-    一个环，而延迟导入只多一次字典查找。
+    `limit` 省略时取写死的 `LOG_PREVIEW_CHARS`（见 app/config.py）。
     """
     if limit is None:
-        try:
-            from .config import get_settings
+        from .config import LOG_PREVIEW_CHARS
 
-            limit = int(get_settings().client_log_preview_chars or 60)
-        except Exception:  # 配置还没就绪（例如被单独 import 做测试）
-            limit = 60
+        limit = LOG_PREVIEW_CHARS
     cleaned = " ".join(str(text or "").split())
     return cleaned if len(cleaned) <= limit else cleaned[: max(1, limit - 1)] + "…"
 

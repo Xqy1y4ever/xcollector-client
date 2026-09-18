@@ -4,17 +4,18 @@
        ↑ 用户只需要配这个                                                    ↑ 客户端读这个
 
 前两步是 `nt_msg_db_util` 的 `1.decrypt.py`，第三步是它的 `3.export.py`
-（都已整合进本项目，见各自模块的说明）。
+（都已整合进本项目，见各自模块的说明）。中间产物一律放在 `nt_msg.db` 旁边
+（上游的默认命名），不再让用户配路径 —— 两个中间文件配错位置只会让人困惑。
 
 ## 什么时候重跑
 
 用**文件时间**判断，不额外存状态：
 
 * `nt_msg.db` 比 `nt_msg_plain.db` 新（或明文库不存在）→ 重新剥头 + 解密；
-* `nt_msg_plain.db` 比 `nt_msg_export.db` 新（或导出库不存在）→ 增量导出。
+* `nt_msg_plain.db` 比 `nt_msg_export.db` 新（或导出库不存在）→ 重新导出。
 
 `--loop` 每轮都会调用这里，而判断本身只是两次 `stat()`，几乎不要钱；
-真正重的活儿只在新数据到来时才做。`--prepare` 会带 `force=True`，无视时间戳全部重跑。
+真正重的活儿只在新数据到来时才做。
 
 ## 失败就是失败
 
@@ -28,15 +29,28 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..config import (
+    DECRYPT_BATCH_SIZE,
+    DECRYPT_INTEGRITY,
+    DECRYPT_MAX_SKIPS,
+    EXPORT_BATCH,
+    EXPORT_INCLUDE_C2C,
+    EXPORT_OVERLAP_SECONDS,
+    NT_MSG_HEADER_SIZE,
+    NT_MSG_HMAC_ALGORITHM,
+    NT_MSG_KDF_ALGORITHM,
+    NT_MSG_KDF_ITER,
+    NT_MSG_PAGE_SIZE,
+)
 from .decrypt import DEFAULT_BATCH_SIZE, DEFAULT_HEADER_SIZE, DecryptError, DecryptReport
 from .decrypt import decrypt_database, sqlcipher_available
-from .export import ExportError, ExportReport, export_database
+from .export import ExportReport, export_database
 
 logger = logging.getLogger(__name__)
 
 # 增量导出时往回多看的时间（秒）。导出是幂等的（主键 msg_id），重导一遍只是慢，
 # 所以宁可多看一点：同一秒里后到的消息也在窗口内。
-DEFAULT_EXPORT_OVERLAP_SECONDS = 3600
+DEFAULT_EXPORT_OVERLAP_SECONDS = EXPORT_OVERLAP_SECONDS
 
 
 @dataclass
@@ -84,17 +98,12 @@ def _is_stale(upstream: Path, downstream: Path) -> bool:
 def resolve_paths(settings) -> tuple[Path, Path, Path, Path]:
     """算出 `(nt_msg.db, nt_msg_clear.db, nt_msg_plain.db, nt_msg_export.db)`。
 
-    中间产物默认都放在 `nt_msg.db` 旁边（和上游 `1.decrypt.py` 的默认命名一致）。
+    中间产物固定放在 `nt_msg.db` 旁边（和上游 `1.decrypt.py` 的默认命名一致）：
+    少两个配置项，也少一处"配错了位置、于是每次都重新解密"的坑。
     """
     source = Path(settings.client_nt_msg_db).expanduser()
-    if settings.client_nt_msg_clear_path.strip():
-        clear = Path(settings.client_nt_msg_clear_path).expanduser()
-    else:
-        clear = source.with_name("nt_msg_clear.db")
-    if settings.client_nt_msg_plain_path.strip():
-        plain = Path(settings.client_nt_msg_plain_path).expanduser()
-    else:
-        plain = source.with_name("nt_msg_plain.db")
+    clear = source.with_name("nt_msg_clear.db")
+    plain = source.with_name("nt_msg_plain.db")
     return source, clear, plain, settings.ntmsg_export_path
 
 
@@ -112,15 +121,12 @@ def read_key(settings) -> str:
     return (settings.client_nt_msg_key or "").strip()
 
 
-def _wanted_tables(settings) -> list[str] | None:
-    raw = (settings.client_decrypt_tables or "").replace("，", ",").strip()
-    if not raw:
-        return None
-    return [part.strip() for part in raw.split(",") if part.strip()]
+def prepare_databases(settings) -> PrepareReport:
+    """按需解密 + 导出。返回的 `export_path` 就是这一轮该读的库。
 
-
-def prepare_databases(settings, *, force: bool = False) -> PrepareReport:
-    """按需解密 + 导出。返回的 `export_path` 就是这一轮该读的库。"""
+    **全量导出**（没有增量模式）：按时间过滤会让"时间戳没变、内容变了"的旧消息
+    永远不进导出库，而客户端那边也就永远发现不了它被编辑过。
+    """
     report = PrepareReport()
     if not (settings.client_nt_msg_db or "").strip():
         report.enabled = False
@@ -139,10 +145,7 @@ def prepare_databases(settings, *, force: bool = False) -> PrepareReport:
             "（QQ 的原始库），不是导出库。"
         )
 
-    decrypt_enabled = bool(settings.client_decrypt_enabled)
-    export_enabled = bool(settings.client_export_enabled)
-
-    if decrypt_enabled and (force or _is_stale(source, plain)):
+    if _is_stale(source, plain):
         if not sqlcipher_available():
             raise DecryptError(
                 "要解密 nt_msg.db，但装不上 sqlcipher3。\n"
@@ -155,57 +158,36 @@ def prepare_databases(settings, *, force: bool = False) -> PrepareReport:
             "解密 %s（密钥 %d 字节，参数 page_size=%s kdf_iter=%s hmac=%s kdf=%s）",
             source.name,
             len(key),
-            settings.client_nt_msg_page_size,
-            settings.client_nt_msg_kdf_iter,
-            settings.client_nt_msg_hmac_algorithm,
-            settings.client_nt_msg_kdf_algorithm,
+            NT_MSG_PAGE_SIZE,
+            NT_MSG_KDF_ITER,
+            NT_MSG_HMAC_ALGORITHM,
+            NT_MSG_KDF_ALGORITHM,
         )
         report.decrypt = decrypt_database(
             source,
             clear,
             plain,
             key,
-            header_size=int(settings.client_nt_msg_header_size),
-            batch_size=int(settings.client_decrypt_batch_size),
-            tables=_wanted_tables(settings),
-            page_size=int(settings.client_nt_msg_page_size),
-            kdf_iter=int(settings.client_nt_msg_kdf_iter),
-            hmac_algorithm=str(settings.client_nt_msg_hmac_algorithm).lower(),
-            kdf_algorithm=str(settings.client_nt_msg_kdf_algorithm).lower(),
-            integrity=str(settings.client_decrypt_integrity),
-            max_skips=int(settings.client_decrypt_max_skips),
+            header_size=NT_MSG_HEADER_SIZE,
+            batch_size=DECRYPT_BATCH_SIZE,
+            page_size=NT_MSG_PAGE_SIZE,
+            kdf_iter=NT_MSG_KDF_ITER,
+            hmac_algorithm=NT_MSG_HMAC_ALGORITHM,
+            kdf_algorithm=NT_MSG_KDF_ALGORITHM,
+            integrity=DECRYPT_INTEGRITY,
+            max_skips=DECRYPT_MAX_SKIPS,
         )
         report.decrypted = True
-    elif decrypt_enabled:
-        logger.debug("%s 比 %s 新，跳过解密", plain.name, source.name)
     else:
-        report.notes.append("CLIENT_DECRYPT_ENABLED=false，未解密")
+        logger.debug("%s 比 %s 新，跳过解密", plain.name, source.name)
 
-    if not export_enabled:
-        report.notes.append("CLIENT_EXPORT_ENABLED=false，未导出（直接读 CLIENT_DB_PATH）")
-        report.export_path = settings.resolved_db_path
-        return report
-
-    if not plain.exists():
-        raise ExportError(
-            f"要导出，但找不到解密后的库 {plain}。"
-            "检查 CLIENT_NT_MSG_DB / CLIENT_NT_MSG_PLAIN_PATH 配置，"
-            "或者把 CLIENT_EXPORT_ENABLED 设成 false 直接读现成的导出库。"
-        )
-
-    if force or _is_stale(plain, export):
-        # 增量导出默认**关**：按时间过滤会让"时间戳没变、内容变了"的旧消息永远进不了
-        # 导出库，而客户端那边也就永远发现不了它被编辑过（见 config 里的说明）。
-        # `--prepare`（force）一定是全量。
-        incremental = bool(settings.client_export_incremental) and not force
+    if _is_stale(plain, export):
         report.export = export_database(
             plain,
             export,
-            batch_size=int(settings.client_export_batch),
-            include_c2c=bool(settings.client_export_include_c2c),
-            overlap_seconds=int(settings.client_export_overlap_seconds),
-            add_seq=bool(settings.client_export_add_seq),
-            resume=incremental,
+            batch_size=EXPORT_BATCH,
+            include_c2c=EXPORT_INCLUDE_C2C,
+            overlap_seconds=EXPORT_OVERLAP_SECONDS,
         )
         report.exported = True
     else:

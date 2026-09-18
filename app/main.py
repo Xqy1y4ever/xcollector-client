@@ -2,14 +2,17 @@
 
 ## 三种跑法
 
-    python -m app.main                 # 定期循环（默认；间隔 CLIENT_POLL_SECONDS）
-    python -m app.main --once           # 只跑一轮就退出（交给 cron / 计划任务）
-    python -m app.main --status         # 只看配置、源库、身份、订阅，不写任何东西
-    python -m app.main --dry-run --once # 只组装不写入，先看一眼会抽出什么
+    python -m app.main --once     # 跑一轮就退出（**推荐**：交给 cron / 计划任务）
+    python -m app.main --loop     # 常驻，按 CLIENT_POLL_SECONDS 定期跑
+    python -m app.main --status   # 只看配置、源库、镜像、身份，不写任何东西
 
 **推荐用 `--once` + 计划任务**：这个客户端本来就是批处理的，把调度交给操作系统
 比让它常驻更省心（也不会有"进程活着但其实卡住了"这种最难发现的故障）。
 `--loop` 只是给不方便配计划任务的人一个选择。
+
+（以前还有 `--prepare` / `--dry-run` / `--since-hours` / `--limit` / `--log-level`。
+它们都去掉了：前两个是"多看一步"的辅助模式，实际上没人用；后三个是把写死的常量
+临时改一下，而"临时改一下"意味着运行结果不可复现。要改就改 `app/config.py`。）
 """
 
 from __future__ import annotations
@@ -20,7 +23,19 @@ import logging
 import sys
 
 from .backend_client import BackendClient, BackendError
-from .config import ConfigError, get_settings, stale_env_keys
+from .config import (
+    DECRYPT_INTEGRITY,
+    DECRYPT_MAX_SKIPS,
+    MAX_MESSAGES_PER_CYCLE,
+    NT_MSG_HEADER_SIZE,
+    NT_MSG_HMAC_ALGORITHM,
+    NT_MSG_KDF_ALGORITHM,
+    NT_MSG_KDF_ITER,
+    NT_MSG_PAGE_SIZE,
+    ConfigError,
+    get_settings,
+    unknown_env_keys,
+)
 from .logging_setup import setup_logging
 from .run import (
     load_processed_raw_ids,
@@ -44,20 +59,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--once", action="store_true", help="只跑一轮就退出（推荐配合计划任务）")
     mode.add_argument("--loop", action="store_true", help="常驻，按 CLIENT_POLL_SECONDS 定期跑")
     mode.add_argument("--status", action="store_true", help="只做自检与统计，不写任何东西")
-    parser.add_argument(
-        "--prepare",
-        action="store_true",
-        help="只做「解密 nt_msg.db + 导出」，强制重跑一遍然后退出",
-    )
-    parser.add_argument("--dry-run", action="store_true", help="只组装不写入")
-    parser.add_argument(
-        "--since-hours",
-        type=int,
-        default=None,
-        help="把「内容改动的回看窗口」放大到 N 小时（不影响「哪些没读过」）",
-    )
-    parser.add_argument("--limit", type=int, default=None, help="本轮最多处理多少条")
-    parser.add_argument("--log-level", default=None, help="覆盖 CLIENT_LOG_LEVEL")
     return parser.parse_args(argv)
 
 
@@ -76,12 +77,8 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
     print(f"  白名单（只收窄）群={group_wl}")
     print(f"                  发送者={sender_wl}")
     print(f"  抽取器          {settings.client_extractor}")
-    print(f"  轮询间隔        {settings.client_poll_seconds}s")
-    print(f"  回看窗口        {settings.client_recheck_overlap_hours}h（已读消息重看、识别内容改动的范围）")
-    print(
-        f"  补充关系        {'开' if settings.client_amendment_enabled else '关'}"
-        f"（只认 {settings.client_amendment_max_age_hours}h 之内的引用）"
-    )
+    print(f"  轮询间隔        {settings.client_poll_seconds}s（用 --once 时不起作用）")
+    print(f"  一轮最多处理    {MAX_MESSAGES_PER_CYCLE} 条（写死的常量，见 app/config.py）")
 
     print("\n=== nt_msg 前置步骤（剥头 + 解密 + 导出）===")
     if not settings.ntmsg_pipeline_enabled:
@@ -98,26 +95,15 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
         else:
             print("  ⚠️ 密钥          没配（CLIENT_NT_MSG_KEY / CLIENT_NT_MSG_KEY_FILE 都是空的）")
         print(
-            f"  解密参数        header={settings.client_nt_msg_header_size} "
-            f"page_size={settings.client_nt_msg_page_size} "
-            f"kdf_iter={settings.client_nt_msg_kdf_iter} "
-            f"kdf={settings.client_nt_msg_kdf_algorithm} "
-            f"hmac={settings.client_nt_msg_hmac_algorithm}"
+            f"  解密参数        header={NT_MSG_HEADER_SIZE} page_size={NT_MSG_PAGE_SIZE} "
+            f"kdf_iter={NT_MSG_KDF_ITER} kdf={NT_MSG_KDF_ALGORITHM} hmac={NT_MSG_HMAC_ALGORITHM}"
+            "（上游常量，见 app/config.py）"
         )
+        print(f"  中间产物        与 nt_msg.db 同目录：nt_msg_clear.db / nt_msg_plain.db")
         print(
-            f"  中间产物        clear={settings.client_nt_msg_clear_path or '(默认：nt_msg.db 旁边)'} "
-            f"plain={settings.client_nt_msg_plain_path or '(默认：nt_msg.db 旁边)'}"
-        )
-        tables = settings.client_decrypt_tables.strip() or "（全部，和上游一样）"
-        print(f"  只解密这些表    {tables}")
-        skips = settings.client_decrypt_max_skips
-        print(
-            f"  SQLite 自检     {settings.client_decrypt_integrity}"
-            f"（坏页最多跳过 {'不限' if skips < 0 else skips} 行，每次跳过都会报 ERROR）"
-        )
-        print(
-            f"  导出            c2c={'是' if settings.client_export_include_c2c else '否'}"
-            f"，补序号列={'是' if settings.client_export_add_seq else '否'}"
+            f"  SQLite 自检     {DECRYPT_INTEGRITY}"
+            f"（坏页最多跳过 {'不限' if DECRYPT_MAX_SKIPS < 0 else DECRYPT_MAX_SKIPS} 行，"
+            "每次跳过都会报 ERROR）"
         )
 
     print("\n=== 源库 ===")
@@ -127,8 +113,7 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
         if settings.ntmsg_pipeline_enabled and not settings.ntmsg_export_path.exists():
             print(
                 f"  还没生成：{settings.ntmsg_export_path}\n"
-                "  先跑一次 `python -m app.main --prepare`（只解密+导出，不入库），"
-                "再回来看这一节。"
+                "  跑一次 `python -m app.main --once`：它会先做剥头 + 解密 + 导出，再入库。"
             )
             return 1
         print(f"  ❌ {exc}")
@@ -136,16 +121,6 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
     print(f"  表 {info['table']}，共 {info['rows']} 行")
     if info["absent"]:
         print(f"  ⚠️ 缺列（会降级使用）：{info['absent']}")
-    seq_col = db.seq_column()
-    print(
-        "  群内序号列      "
-        + (
-            f"{seq_col} → 能确定性地解析「这条在回复哪一条」"
-            if seq_col
-            else "**没有** → 认不出引用关系，引用了别人的消息会按独立新消息处理"
-            "（源表缺 40003/seq 这一类列，见 README）"
-        )
-    )
     latest = db.latest()
     print(f"  最新一条的时间戳：{latest[0] if latest else '（空库）'}")
 
@@ -153,7 +128,6 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
     mirror = Mirror(settings.resolved_mirror_path)
     stats = mirror.stats()
     print(f"  共 {stats['total']} 条，状态 {stats['by_state'] or {}}")
-    print(f"  补充关系 {stats['amendments']} 条")
     print(f"  水位线（已处理完的最大时间戳）：{mirror.watermark() or '（还没有）'}")
     # 读什么由**这个**决定，不由时间决定：源库里没被标记过的都要读，不管多老。
     try:
@@ -202,51 +176,8 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
     return 0
 
 
-async def run_prepare(settings) -> int:
-    """`--prepare`：强制重跑一遍「解密 + 导出」，不做任何入库动作。
-
-    单独留这个入口，是因为第一次配置密钥/参数时最容易出错，而"跑一轮同步"会把
-    解密、导出、模型调用混在一起，看不出问题出在哪一步。`--prepare` 只碰本地文件。
-    """
-    from .ntmsg_db import prepare_databases
-    from .ntmsg_db.decrypt import DecryptError
-    from .ntmsg_db.export import ExportError
-
-    if not settings.ntmsg_pipeline_enabled:
-        logger.error(
-            "没有配置 CLIENT_NT_MSG_DB，没有可准备的东西。"
-            "（--prepare 是给「只给一个 nt_msg.db 路径」这种用法准备的）"
-        )
-        return 2
-    try:
-        report = prepare_databases(settings, force=True)
-    except (DecryptError, ExportError) as exc:
-        logger.error("准备失败：%s", exc)
-        return 2
-    print("=== 剥头 + 解密 + 导出 ===")
-    print(f"  nt_msg.db       {settings.client_nt_msg_db}")
-    print(f"  剥头产物        {report.clear_path}")
-    print(f"  明文库          {report.plain_path}")
-    print(f"  导出库          {report.export_path}")
-    if report.decrypt is not None:
-        print(f"  解密            {report.decrypt.summary()}")
-        print(f"  SQLite 自检     {report.decrypt.integrity}")
-        for item in report.decrypt.per_table:
-            flag = "  ⚠️ 跳过 %d 行" % item.skipped_rows if item.skipped_rows else ""
-            print(
-                f"      {item.table:<24} {item.copied_rows:>9,}/{item.source_rows:<9,} 行{flag}"
-            )
-        if report.decrypt.skipped_rowids:
-            print(f"  ⚠️ 被跳过的 rowid {report.decrypt.skipped_rowids}")
-    if report.export is not None:
-        print(f"  导出            {report.export.summary()}")
-        for table, written in report.export.written_rows.items():
-            print(f"      {table:<24} {written:>9,} 行")
-    print("\n下一步：python -m app.main --status 看看源库和订阅。")
-    return 0
-
-
-async def run_once(backend: BackendClient, settings, *, since_hours: int | None = None) -> int:
+async def run_once(backend: BackendClient, settings) -> int:
+    """跑一轮：先确保源库是最新的（解密 + 导出），再入库。"""
     from .ntmsg_db import prepare_databases
     from .ntmsg_db.decrypt import DecryptError
     from .ntmsg_db.export import ExportError
@@ -265,30 +196,9 @@ async def run_once(backend: BackendClient, settings, *, since_hours: int | None 
         logger.error("%s", exc)
         return 2
 
-    if since_hours is not None:
-        # `--since-hours N` = 把「内容改动的回看窗口」放大到 N 小时。
-        #
-        # ⚠️ 它**不**决定"哪些没读过"：没读过的消息无论如何都会被读到（判据是镜像里的
-        # 已读标记）。它的真正用途是把**已经读过、但内容可能被改过**的消息的重看范围
-        # 放大 —— 比如改了抽取规则想重跑、或者怀疑某批老消息被编辑过。
-        # 实现方式是临时放大回看窗口，而不是去动镜像 ——
-        # 镜像记的是事实（每一条处理过没有），不该被一次调用改写。
-        logger.info(
-            "按 --since-hours=%s 把「内容改动的回看窗口」临时放大到 %s 小时"
-            "（已读消息里，这个范围内的会重新比对内容指纹）",
-            since_hours,
-            since_hours,
-        )
-        settings = settings.model_copy(
-            update={
-                "client_recheck_overlap_hours": float(since_hours),
-                # 同时关掉"后端已经有这条通知就跳过抽取"的捷径 ——
-                # 否则镜像被删过之后，改过的老消息永远更新不了
-                "client_force_recheck": True,
-            }
-        )
-
-    report = await run_cycle(backend, settings, db=db, resolver=AttachmentResolver(settings.resolved_attachment_root))
+    report = await run_cycle(
+        backend, settings, db=db, resolver=AttachmentResolver(settings.resolved_attachment_root)
+    )
     log_report(report)
     # 一条都没处理成功、而且有错 → 用非零退出码，让计划任务/监控能发现
     if report.errors and report.processed == 0 and report.scanned > 0:
@@ -298,10 +208,6 @@ async def run_once(backend: BackendClient, settings, *, since_hours: int | None 
 
 async def amain(args: argparse.Namespace) -> int:
     settings = get_settings()
-    if args.dry_run:
-        settings = settings.model_copy(update={"client_dry_run": True})
-    if args.limit is not None:
-        settings = settings.model_copy(update={"client_max_messages_per_cycle": int(args.limit)})
 
     if not settings.backend_base_url:
         logger.error("没有配置 BACKEND_BASE_URL")
@@ -325,13 +231,17 @@ async def amain(args: argparse.Namespace) -> int:
         logger.error("配置有问题：%s", exc)
         return 2
 
-    # `.env` 里留着已经失效的键时**必须出声**：`extra="ignore"` 让它们静悄悄地
-    # 什么都不做，于是"我配了"和"根本没生效"长得一模一样。
-    for key, instead in stale_env_keys():
+    # `.env` 里写了但不是配置项的键**必须出声**：`extra="ignore"` 让它们静悄悄地
+    # 什么都不做，于是"我配了"和"根本没生效"长得一模一样。配置项只剩十几个之后，
+    # 从旧版本升上来的 `.env` 里会有一大批这种键。
+    unknown = unknown_env_keys()
+    if unknown:
         logger.warning(
-            ".env 里的 %s 已经失效（不影响启动，但配了等于没配）：%s。可以直接删掉这一行。",
-            key,
-            instead,
+            ".env 里有 %d 个键**不是配置项**（不影响启动，但配了等于没配）：%s%s。"
+            "可以删掉这些行（配置项只有十几个，见 .env.example）",
+            len(unknown),
+            ", ".join(unknown[:12]),
+            " …" if len(unknown) > 12 else "",
         )
 
     db = SourceDatabase(settings.ntmsg_export_path)
@@ -339,13 +249,11 @@ async def amain(args: argparse.Namespace) -> int:
     try:
         if args.status:
             return await show_status(backend, settings, db)
-        if args.prepare:
-            return await run_prepare(settings)
         await verify_identity(backend, settings)
         if args.loop or not args.once:
             await run_loop(backend, settings)
             return 0
-        return await run_once(backend, settings, since_hours=args.since_hours)
+        return await run_once(backend, settings)
     except ConfigError as exc:
         # 配置错误**不进重试、也不降级**：它只会让某些来源安静地不入库
         logger.error("配置有问题：%s", exc)
@@ -365,7 +273,7 @@ async def amain(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    setup_logging(args.log_level)
+    setup_logging(get_settings().client_log_level)
     try:
         return asyncio.run(amain(args))
     except KeyboardInterrupt:

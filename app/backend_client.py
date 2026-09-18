@@ -1,4 +1,4 @@
-"""后端客户端：**只用 UserToken**，只调用户令牌允许调的那些接口。
+﻿"""后端客户端：**只用 UserToken**，只调用户令牌允许调的那些接口。
 
 ## 为什么这份文件里的方法这么少
 
@@ -29,7 +29,7 @@ from typing import Any
 
 import httpx
 
-from .config import Settings, get_settings
+from .config import BACKEND_MAX_RETRIES, BACKEND_TIMEOUT, Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,7 @@ class BackendClient:
             headers["Authorization"] = f"Bearer {self.settings.client_token}"
         self._client = httpx.AsyncClient(
             base_url=self.settings.backend_base,
-            timeout=self.settings.backend_timeout,
+            timeout=BACKEND_TIMEOUT,
             headers=headers,
         )
 
@@ -140,7 +140,7 @@ class BackendClient:
             return {}
 
     def _write(self, method: str, url: str, **kwargs: Any) -> Any:
-        kwargs.setdefault("retries", self.settings.backend_max_retries)
+        kwargs.setdefault("retries", BACKEND_MAX_RETRIES)
         return self._request(method, url, **kwargs)
 
     # ------------------------------------------------------------------
@@ -212,7 +212,7 @@ class BackendClient:
                 files={"file": (filename or "file", content, content_type)},
                 data=form,
                 purpose="attachments",
-                retries=self.settings.backend_max_retries,
+                retries=BACKEND_MAX_RETRIES,
             )
         except BackendError as exc:
             logger.warning("上传附件失败 filename=%s：%s", filename, exc)

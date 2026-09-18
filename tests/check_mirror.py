@@ -27,7 +27,6 @@ from app.mirror import (
     STATE_PENDING,
     STATE_SKIPPED,
     Mirror,
-    content_hash,
 )
 from app.source.ntmsg import SourceMessage
 
@@ -72,72 +71,44 @@ def main() -> int:  # noqa: C901
     mirror = Mirror(db)
 
     # ------------------------------------------------------------------
-    print("--- 1. 第一次见 → new，而且记成 pending（先记账再干活）---")
-    row, what = mirror.claim(msg("1"))
-    check("结果是 new", what, "new")
+    print("--- 1. 第一次见 → 登记成 pending（先记账再干活）---")
+    row = mirror.claim(msg("1"))
     check("状态是 pending（不是 done）", row.state, STATE_PENDING)
     check("attempts 从 0 开始", row.attempts, 0)
-    check_true("记了内容指纹", bool(row.content_hash), row.content_hash)
+    check_true("群号/发送者/时间都记下来了",
+               (row.group_id, row.sender_id, row.source_ts) == ("g1", "10001", 1000),
+               str(row))
 
-    print("\n--- 2. 没处理完就再来一次 → retry（这就是崩溃恢复）---")
-    _, what = mirror.claim(msg("1"))
-    check("还没标完成 → retry", what, "retry")
+    print("\n--- 2. 没处理完就再来一次 → 仍然 pending（这就是崩溃恢复）---")
+    again = mirror.claim(msg("1"))
+    check("状态没被覆盖成别的", again.state, STATE_PENDING)
     check_true("而且确实被列进未完成队列", any(r.msg_id == "1" for r in mirror.unfinished()))
 
-    print("\n--- 3. 标完成之后、内容没变 → unchanged（零成本跳过）---")
+    print("\n--- 3. 标完成之后 → 不再出现在未完成队列里（下一轮零成本跳过）---")
     mirror.finish("1", state=STATE_DONE, raw_id="raw-1")
-    _, what = mirror.claim(msg("1"))
-    check("→ unchanged", what, "unchanged")
-    check("raw_id 记下来了（补充要落回它）", mirror.raw_id_of("1"), "raw-1")
-
-    print("\n--- 4. 内容变了 → changed（要重新处理，后端幂等会更新那条任务）---")
-    _, what = mirror.claim(msg("1", text="下周三前交材料（改到周五）"))
-    check("正文变了 → changed", what, "changed")
-    check("状态回到 pending", mirror.get("1").state, STATE_PENDING)
-    check_true("指纹也更新了", mirror.get("1").content_hash != row.content_hash)
-    # 复原
-    mirror.finish("1", state=STATE_DONE, raw_id="raw-1")
-
-    print("\n--- 5. 指纹只跟**内容**有关，不跟标识有关 ---")
-    base = content_hash(msg("1"))
-    check("同一条消息算两次一样", content_hash(msg("1")), base)
-    check_true("换 msg_id 不影响指纹（标识不是内容）", content_hash(msg("999")) == base, "两者应相同")
-    check_true("换时间戳不影响指纹", content_hash(msg("1", ts=99999)) == base)
-    check_true("改正文就变了", content_hash(msg("1", text="别的")) != base)
-    check_true(
-        "改附件就变了",
-        content_hash(msg("1", attachments=[{"type": "image", "name": "a.png"}])) != base,
-    )
-    check_true(
-        "附件顺序不影响指纹（否则同一批图每次算出来都不一样）",
-        content_hash(msg("1", attachments=[
-            {"type": "image", "name": "a.png"}, {"type": "file", "name": "b.pdf"}]
-        ))
-        == content_hash(msg("1", attachments=[
-            {"type": "file", "name": "b.pdf"}, {"type": "image", "name": "a.png"}]
-        )),
-    )
+    mirror.claim(msg("1"))
+    check("状态还是 done（claim 不覆盖已有状态）", mirror.get("1").state, STATE_DONE)
+    check("raw_id 记下来了（重试/回溯要用它）", mirror.raw_id_of("1"), "raw-1")
+    check_true("不在未完成队列里", not any(r.msg_id == "1" for r in mirror.unfinished()))
 
     # ------------------------------------------------------------------
-    print("\n--- 6. 失败 → failed，而且会被重试 ---")
-    _, _ = mirror.claim(msg("2"))
+    print("\n--- 4. 失败 → failed，而且会被重试 ---")
+    mirror.claim(msg("2"))
     mirror.finish("2", state=STATE_FAILED, error="后端 502")
     got = mirror.get("2")
     check("状态是 failed", got.state, STATE_FAILED)
     check("attempts 加了 1", got.attempts, 1)
     check("错误留下了（不是静默失败）", got.last_error, "后端 502")
     check_true("未完成队列里有它", any(r.msg_id == "2" for r in mirror.unfinished()))
-    _, what = mirror.claim(msg("2"))
-    check("重试时结果是 retry", what, "retry")
 
-    print("\n--- 7. skipped 也是终态（订阅之外/闲聊不该每轮重看）---")
-    _, _ = mirror.claim(msg("3"))
-    mirror.finish("3", state=STATE_SKIPPED, error="不在订阅范围内")
+    print("\n--- 5. skipped 也是终态（白名单外/闲聊不该每轮重看）---")
+    mirror.claim(msg("3"))
+    mirror.finish("3", state=STATE_SKIPPED, error="whitelist:group 群 g1 不在名单里")
     check_true("skipped 不在未完成队列里", not any(r.msg_id == "3" for r in mirror.unfinished()))
-    _, what = mirror.claim(msg("3"))
-    check("再来一次是 unchanged", what, "unchanged")
+    mirror.claim(msg("3"))
+    check("状态保持 skipped", mirror.get("3").state, STATE_SKIPPED)
 
-    print("\n--- 8. 水位线只算**处理完**的那些 ---")
+    print("\n--- 6. 水位线只算**处理完**的那些 ---")
     mirror.claim(msg("4", ts=5000))
     mirror.finish("4", state=STATE_DONE)
     # 5 号是一条更大的时间戳，但还没处理完
@@ -147,31 +118,29 @@ def main() -> int:  # noqa: C901
     check("5 完成之后水位线跟到 9000", mirror.watermark(), 9000)
 
     # ------------------------------------------------------------------
-    print("\n--- 9. 补充关系 ---")
-    mirror.mark_amendment("200", "100")
-    check("记下来了", mirror.amendment_of("200"), "100")
-    check("没记过的返回 None", mirror.amendment_of("201"), None)
-    mirror.mark_amendment("200", "100")  # 重复记
-    check("重复记不会炸，也不改变结果", mirror.amendment_of("200"), "100")
-    check("统计里能看到补充条数", mirror.stats()["amendments"], 1)
-    check("不是补充的消息也返回 None", mirror.amendment_of("1"), None)
+    print("\n--- 7. 白名单改了 → 把因它跳过的放回待处理 ---")
+    check("放回来了 1 条", mirror.reopen_whitelist_skips(), 1)
+    check("状态回到 pending", mirror.get("3").state, STATE_PENDING)
+    check("原因被清掉了（下次要重新判）", mirror.get("3").last_error, None)
+    check_true("它又进了未完成队列", any(r.msg_id == "3" for r in mirror.unfinished()))
+    check("再放一次是 0 条（幂等）", mirror.reopen_whitelist_skips(), 0)
 
     # ------------------------------------------------------------------
-    print("\n--- 10. 统计与批量查询 ---")
+    print("\n--- 8. 统计与批量查询 ---")
     stats = mirror.stats()
     check("总数对得上", stats["total"], 5)
     check_true("按状态分类里有 done", stats["by_state"].get("done", 0) >= 3, str(stats["by_state"]))
-    check_true("按状态分类里有 skipped", stats["by_state"].get("skipped", 0) >= 1, str(stats["by_state"]))
+    check_true("按状态分类里有 pending", stats["by_state"].get("pending", 0) >= 1, str(stats["by_state"]))
     many = mirror.get_many(["1", "2", "nope"])
     check("批量查只返回存在的", sorted(many), ["1", "2"])
     check("批量查空列表返回空", mirror.get_many([]), {})
 
-    print("\n--- 11. 库文件真的落在指定路径（不是内存）---")
+    print("\n--- 9. 库文件真的落在指定路径（不是内存）---")
     check_true("文件存在", db.exists(), str(db))
     check_true("换个实例读到的状态一样（真的持久化了）", Mirror(db).get("1").state, STATE_DONE)
 
     # ------------------------------------------------------------------
-    print("\n--- 12. 群里「上一条消息」的时间取自镜像（缺口检测用）---")
+    print("\n--- 10. 群里「上一条消息」的时间取自镜像（缺口检测用）---")
     # 以前这个是后端的共享 group_state 给的：两个客户端写同一张表会互相把
     # previous 顶掉，缺口告警就静默地漏。现在从自己的镜像里算。
     gap_dir = ROOT / ".tmp-test" / "mirror-gap"

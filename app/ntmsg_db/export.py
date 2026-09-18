@@ -2,7 +2,7 @@
 
 **这一层是 `nt_msg_db_util` 的 `3.export.py` 整合进本项目的版本。**
 上游的 `msgdb` 包已经**逐字**搬到本仓库根目录（见 `msgdb/VENDORED.md`），
-这里只做三件事：把上游的流程串起来、加上客户端要的进度与报告、补两列。
+这里只做两件事：把上游的流程串起来、加上客户端要的进度与报告。
 
 流程与上游完全一致：
 
@@ -15,18 +15,12 @@
 表结构、`content` 的形状（`{"type":"msg_body","segments":[...]}`）、`parse_status`
 的取值都由上游的 `msgdb` 决定 —— **这一层不改它的形状**，客户端那边按这个形状读。
 
-## 客户端加的三件事
+## 全量，不做增量
 
-1. **增量**（`since_ts`）：上游每次都全量解析 77 万行。客户端是"定期跑"的，
-   所以默认只解析水位线之后的行（同一个 SELECT 外面套一层 WHERE），
-   没变过的老行不再重复解析。`force`（`--prepare`）时退回全量。
-2. **补 `"40003"` / `"40850"` 两列**：群内消息序号、被回复消息的群内序号。
-   上游的 `group_messages` 没有它们，于是"这条消息是在补充哪条通知"没法确定性
-   反查（客户端只好把它当成一条新消息）。补这两列之后补充关系才能真正落到
-   原来那条任务上。列是**后加的**，所以不影响任何按列名读取的消费者。
-3. **报告**：写了多少行、解析状态分布、多少行转换失败。上游把失败行记在
-   `errors` 计数里就继续跑 —— 这里同样继续跑（一条消息解析失败不该中断整个导出），
-   但把计数和最后一例原因报出来。
+上游每次都全量解析（实测 77 万行约 45 秒）。客户端**也全量**：按时间过滤会让
+"时间戳没变、内容变了"的旧消息永远进不了导出库 —— 上层的判断就都建立在旧内容
+上了。45 秒换"导出库和源库一致"，这笔账是划算的。
+（`since_ts` 参数还留着，是给"我知道自己在干什么"的调用方用的；正常路径不传。）
 """
 
 from __future__ import annotations
@@ -50,7 +44,7 @@ from msgdb.export_schema import (
 )
 from msgdb.group import exporter as group_exporter
 
-from ..utils import quote_sql, sqlite_uri
+from ..utils import sqlite_uri
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +52,6 @@ logger = logging.getLogger(__name__)
 LOG_INTERVAL = 50_000
 
 DEFAULT_BATCH_SIZE = 2000
-
-# 后加的两列：列名和含义都来自上游的字段文档（`db_docs/group_msg_table/`）。
-#   "40003" 群内消息序号（每个群各自一套，所以反查时要带 group_id）
-#   "40850" 被回复消息的群内序号
-SEQ_COLUMN = "40003"
-REPLY_SEQ_COLUMN = "40850"
 
 
 class ExportError(RuntimeError):
@@ -80,8 +68,6 @@ class ExportReport:
     parse_status: dict[str, int] = field(default_factory=dict)
     failed_rows: int = 0
     last_error: str | None = None
-    seq_added: bool = False
-    seq_filled: int = 0
     since_ts: int = 0
     watermark: int = 0
     seconds: float = 0.0
@@ -97,21 +83,19 @@ class ExportReport:
     def summary(self) -> str:
         parts = [f"写入 {self.total_written:,} 行"]
         if self.since_ts:
-            parts.append(f"（增量：只处理 {self.since_ts} 之后的行）")
+            parts.append(f"（只处理 {self.since_ts} 之后的行）")
         if self.parse_status:
             parts.append(
                 "正文解析：" + "、".join(f"{k} {v:,}" for k, v in sorted(self.parse_status.items()))
             )
         if self.failed_rows:
             parts.append(f"⚠️ {self.failed_rows} 行转换失败（最后一条：{self.last_error}）")
-        if self.seq_added:
-            parts.append(f"补序号列 {self.seq_filled:,} 行")
         parts.append(f"耗时 {self.seconds:.1f}s")
         return "；".join(parts)
 
 
 def _incremental_sql(select_sql: str, since_ts: int) -> tuple[str, tuple]:
-    """给上游的 SELECT 外面套一层增量过滤。
+    """给上游的 SELECT 外面套一层时间过滤（`since_ts=0` 时原样返回 = 全量）。
 
     上游的语句以 `ORDER BY "40001"` 结尾，包成子查询后 SQLite 会把 WHERE 条件下推，
     效果和改写原语句一样；这样就不必去动 `msgdb` 里的常量（保持逐字搬运）。
@@ -121,54 +105,8 @@ def _incremental_sql(select_sql: str, since_ts: int) -> tuple[str, tuple]:
     return f"SELECT * FROM ({select_sql}) WHERE timestamp >= ?", (since_ts,)
 
 
-def _add_seq_columns(dst: sqlite3.Connection, src_path: Path, report: ExportReport) -> None:
-    """补 `"40003"` / `"40850"` 两列，并从源库把值填进去。
-
-    为什么是"导完再补"而不是改上游的 INSERT：这样 `msgdb/` 保持与上游逐字一致
-    （上游升级时直接覆盖即可），扩展只活在客户端自己的代码里。
-
-    实现上把源库 ATTACH 进来做一条 `UPDATE ... = (SELECT ...)`：源表的 `"40001"`
-    是 `INTEGER PRIMARY KEY`（rowid 别名），所以每条都是一次主键查找。
-    """
-    columns = {str(r[1]) for r in dst.execute('PRAGMA table_info("group_messages")')}
-    for column in (SEQ_COLUMN, REPLY_SEQ_COLUMN):
-        if column not in columns:
-            dst.execute(f'ALTER TABLE group_messages ADD COLUMN "{column}" INTEGER')
-    report.seq_added = True
-
-    dst.execute(
-        "ATTACH DATABASE " + quote_sql(sqlite_uri(src_path, "ro")) + " AS seqsrc"
-    )
-    try:
-        has = {
-            str(r[1])
-            for r in dst.execute('PRAGMA seqsrc.table_info("group_msg_table")').fetchall()
-        }
-        sets: list[str] = []
-        if SEQ_COLUMN in has:
-            sets.append(
-                f'"{SEQ_COLUMN}" = (SELECT s."{SEQ_COLUMN}" FROM seqsrc.group_msg_table s '
-                f'WHERE s."40001" = group_messages.msg_id)'
-            )
-        if REPLY_SEQ_COLUMN in has:
-            sets.append(
-                f'"{REPLY_SEQ_COLUMN}" = (SELECT s."{REPLY_SEQ_COLUMN}" '
-                f'FROM seqsrc.group_msg_table s WHERE s."40001" = group_messages.msg_id)'
-            )
-        if not sets:
-            logger.info("源表里没有 %s/%s 这两列，序号列留空", SEQ_COLUMN, REPLY_SEQ_COLUMN)
-            return
-        before = dst.execute('SELECT count(*) FROM group_messages WHERE "40003" IS NOT NULL').fetchone()[0]
-        dst.execute(f'UPDATE group_messages SET {", ".join(sets)}')
-        after = dst.execute('SELECT count(*) FROM group_messages WHERE "40003" IS NOT NULL').fetchone()[0]
-        report.seq_filled = int(after) - int(before)
-        dst.commit()
-    finally:
-        dst.execute("DETACH DATABASE seqsrc")
-
-
 def watermark(path: Path | str, table: str = "group_messages") -> int:
-    """导出库里已有的最大时间戳（增量导出的起点）。没有就返回 0。"""
+    """导出库里已有的最大时间戳。没有就返回 0（报告里用）。"""
     path = Path(path)
     if not path.exists():
         return 0
@@ -195,17 +133,12 @@ def export_database(
     include_c2c: bool = True,
     since_ts: int = 0,
     overlap_seconds: int = 0,
-    add_seq: bool = True,
-    resume: bool = True,
     progress: Callable[[int, int, str], None] | None = None,
 ) -> ExportReport:
-    """`nt_msg_plain.db` → `nt_msg_export.db`。
+    """`nt_msg_plain.db` → `nt_msg_export.db`（**全量**）。
 
-    `resume=True` 时按导出库里已有的最大时间戳接着导（并往回多看
-    `overlap_seconds` 秒）。**默认（`resume=False`）是全量**，因为按时间过滤有个
-    后果：时间戳没变、内容被改过的旧消息不会重新进导出库 —— 客户端那一层靠内容
-    指纹发现"内容变了"的前提就是导出库里有新内容。全量的代价是每轮重新解析一遍
-    源库（实测 77 万行约 45 秒）。
+    `since_ts`/`overlap_seconds` 只在调用方明确要给一个起点时才用（正常路径不传，
+    即全量）。按时间过滤的代价见模块开头那段说明。
     """
     started = time.monotonic()
     src_path = Path(src)
@@ -215,17 +148,8 @@ def export_database(
     dst_path.parent.mkdir(parents=True, exist_ok=True)
 
     report = ExportReport(src=src_path, dst=dst_path)
-    if resume and since_ts <= 0:
-        existing = watermark(dst_path)
-        if existing > 0:
-            since_ts = max(1, existing - max(0, overlap_seconds))
-            logger.info(
-                "%s 里已经导到 %s，从 %s 接着导（含 %d 秒回看）",
-                dst_path.name,
-                existing,
-                since_ts,
-                overlap_seconds,
-            )
+    if since_ts > 0 and overlap_seconds:
+        since_ts = max(1, since_ts - max(0, overlap_seconds))
     report.since_ts = since_ts
 
     try:
@@ -248,8 +172,6 @@ def export_database(
                 "并把解密/导出这两步关掉。"
             )
 
-        # uri=True 是必须的：下面补序号列时要用 `ATTACH 'file:...?mode=ro'`，
-        # 而 ATTACH 只在这个连接本身按 URI 打开时才认 URI 文件名。
         with closing(
             sqlite3.connect(sqlite_uri(dst_path, "rwc"), uri=True, timeout=60.0)
         ) as dst_conn:
@@ -294,10 +216,6 @@ def export_database(
 
             logger.info("建立二级索引…")
             create_indexes(dst_conn)
-
-            if add_seq:
-                logger.info("补 %s / %s 两列（补充关系要用）…", SEQ_COLUMN, REPLY_SEQ_COLUMN)
-                _add_seq_columns(dst_conn, src_path, report)
 
             logger.info("重建 FTS 索引（上游的 3.export.py 也做这一步）…")
             rebuild_fts(dst_conn)

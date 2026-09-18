@@ -1,14 +1,30 @@
-"""配置。全部来自环境变量 / `.env`，每一项都有默认值。
+"""配置：**只有十几个**环境变量，其余参数写死在下面那一块常量里。
 
 **字段名 = 环境变量名的小写形式**（`CLIENT_DB_PATH` → `client_db_path`）。
 这不是随便定的：`pydantic-settings` 默认按字段名去找环境变量，名字对不上就会
 **静默忽略**那个变量（`extra="ignore"`），于是"我明明配了"和"根本没生效"长得
 一模一样 —— 这个坑在 CLI 冒烟时真踩到过一次。所以两边必须严格同名，
 和 `xcollector-bot` / `xcollector-backend` 的写法保持一致。
+
+## 为什么砍到十几个
+
+以前这里是 54 个配置项。每一项都"看起来很有用"，但代价是：用户要读 54 行才知道
+自己在配什么、配错一个不影响启动只影响行为（最难查的那类故障）、以及**升级时
+旧键留在 `.env` 里却不生效**。
+
+现在的分工很清楚：
+
+* **必须由用户给的** → 环境变量（下面 `Settings` 里那十几个）；
+* **有默认值就够的** → 写死成常量（`HARDCODED` 那一块），想改就改代码。
+
+`unknown_env_keys()` 会在启动时把"`.env` 里写了、但不是配置项"的键报出来一次 ——
+`extra="ignore"` 的另一面就是"配了等于没配"。
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from datetime import timedelta, timezone, tzinfo
@@ -90,194 +106,64 @@ class Settings(BaseSettings):
     # 用服务令牌也能跑，但那意味着这个客户端能读写所有人的数据，与
     # "每人一个客户端"的设计相悖；启动自检会把这件事说清楚。
     client_token: str = ""
-    backend_timeout: float = 20.0
-    # 写接口失败后的重试次数（不含首次），退避 1s/2s/4s
-    backend_max_retries: int = 3
 
-    # ---------------- 源库 ----------------
-    # nt_msg_db_util 的 3.export.py 产出的**结构化导出库**（明文 SQLite）
-    client_db_path: str = ""
-    # 一次性最多从库里取多少条新消息。别设太大：一批全失败时重试的代价很高。
-    client_batch_size: int = 200
-    # 一轮最多处理多少条（防止第一次运行就一口气吃掉几十万条）。
-    #
-    # 注意"读什么"的判据：**镜像里的已读标记**，不是时间窗口。源库里凡是镜像里没有的
-    # 都要读，不管它多老 —— 时间窗口会让"比窗口更老、而镜像里又没有"的消息（换过导出
-    # 库、镜像被删过、白名单刚放开）永远读不到，而那正是"静默漏掉通知"。
-    # 这个值只决定**一轮读多少**，不决定读哪些。
-    client_max_messages_per_cycle: int = 500
-    # 附件字节的搜索根目录（可选）。nt_msg_export.db 里的图片/文件通常只有
-    # CDN URL 和 md5，没有本地路径；如果 NTQQ 的附件目录也导出到了某个地方，
-    # 把根目录配在这里，客户端就能按 md5/文件名找回真实字节。
-    client_attachment_root: str = ""
-    # 找不到字节时怎么记：`url`（只留 CDN 地址，可能是死链）/ `skip`（不记附件）
-    client_missing_attachment: Literal["url", "skip"] = "url"
-
-    # ---------------- nt_msg.db：剥头 + 解密 + 导出（可选的一整套前置步骤） ----------------
-    # 配了 `CLIENT_NT_MSG_DB` 之后，客户端就**只要这一个输入**：
-    #
-    #   nt_msg.db ─剥头→ nt_msg_clear.db ─解密→ nt_msg_plain.db ─导出→ nt_msg_export.db
-    #
-    # 这三步就是 `nt_msg_db_util` 的 `1.decrypt.py` 与 `3.export.py`（已整合进本项目，
-    # 见 `app/ntmsg_db/`）。不解密的话，用户得自己跑那两个脚本。
-    #
-    # **留空 = 完全不起作用**：行为和以前一样，直接读 CLIENT_DB_PATH。
+    # ---------------- 输入（二选一）----------------
+    # A 方案：QQ 的原始加密库。给了它，客户端自己完成"剥头 + 解密 + 导出"。
     client_nt_msg_db: str = ""
-    # 密钥（16 字节 ASCII，从 NTQQ 进程内存里自己取；见 README）。**别提交进仓库。**
+    # 16 字节 ASCII 密钥。**别提交进仓库**；优先用下面的文件形式。
     client_nt_msg_key: str = ""
-    # 或者从文件读密钥 —— 比放进环境变量好：环境变量会出现在 `ps`/`/proc`、
+    # 从文件读密钥 —— 比放进环境变量好：环境变量会出现在 `ps`/`/proc`、
     # 容器 inspect、以及 CI 日志里。文件内容首尾空白会被去掉。
     client_nt_msg_key_file: str = ""
-    # 中间产物放哪。留空 = 放在 nt_msg.db 旁边（上游的默认命名）。
-    client_nt_msg_clear_path: str = ""
-    client_nt_msg_plain_path: str = ""
-    # nt_msg.db 前面那段 QQ 自定义头的长度（固定 1024）。
-    client_nt_msg_header_size: int = 1024
-    # 下面这几个是上游 1.decrypt.py 用的 PRAGMA 值，**不要随便改**
-    # （改了就等于换了一套加密参数，只有你自己造过库才需要）。
-    client_nt_msg_page_size: int = 4096
-    client_nt_msg_kdf_iter: int = 4000
-    client_nt_msg_kdf_algorithm: Literal["sha1", "sha256", "sha512"] = "sha512"
-    client_nt_msg_hmac_algorithm: Literal["sha1", "sha256", "sha512"] = "sha1"
-    # 解密这一步要不要跑（关掉 = 明文库/导出库你自己维护）。
-    client_decrypt_enabled: bool = True
-    # 每批从加密库读多少行（遇坏页会自动缩小，成功后再放大回来）。
-    client_decrypt_batch_size: int = 5000
-    # 只解密哪些表，逗号分隔。留空 = 全部（上游行为）。
-    #
-    # 客户端只用到 group_msg_table / c2c_msg_table，但其余表都不大，所以默认全拷
-    # （好处是得到的 nt_msg_plain.db 和上游一样，能直接给 nt_msg_search.py 用）。
-    client_decrypt_tables: str = ""
-    # 解完让 SQLite 自己查一遍明文库：quick（默认）/ full / off。只影响报告。
-    client_decrypt_integrity: Literal["quick", "full", "off"] = "quick"
-    # 允许多少行因为坏页被跳过。-1 = 不限（上游行为）。
-    #
-    # 坏页是真实存在的（上游为此专门写了"重连 + 缩小批次 + 跳过坏 rowid"）。
-    # 默认容忍是为了不因为一个坏页卡死整天，但**每一次跳过都会打 ERROR 级日志并
-    # 记进报告** —— 被跳过的行意味着那几条消息永远进不来，这必须让人看见。
-    client_decrypt_max_skips: int = -1
-    # 导出这一步要不要跑。
-    client_export_enabled: bool = True
-    # 要不要连私聊消息一起导。默认 true = 和上游 3.export.py 一样两张表都导；
-    # 客户端本身只入库群通知（订阅是按 (群, 发送者) 组织的），私聊只是顺带。
-    client_export_include_c2c: bool = True
-    client_export_batch: int = 2000
-    # 给 group_messages 补 "40003"/"40850" 两列（群内序号、被回复消息的序号）。
-    # 上游的导出表没有它们，"这条消息在补充哪条通知"就没法确定性反查。
-    client_export_add_seq: bool = True
-    # 增量导出：只把**水位线之后**的源行写进导出库。
-    #
-    # **默认关**（每次都全量导出）。理由和读取那一层是同一个：按时间过滤会让
-    # "时间戳没变、内容变了"的旧消息永远不进导出库 —— 于是一层一层往上看，
-    # 客户端那边也永远发现不了它被编辑过。全量的代价是每轮重新解析一遍源库
-    # （实测 77 万行约 45 秒），换来的是"导出库和源库一致"。
-    #
-    # 打开它（true）能省时间，但要接受上面那条看不到编辑的代价。
-    client_export_incremental: bool = False
-    # 只在上面的增量模式生效时用：往回多看多少秒（导出是幂等的，多看只会慢一点）。
-    client_export_overlap_seconds: int = 3600
+    # B 方案：现成的结构化导出库（`nt_msg_db_util` 的 3.export.py 产物）。
+    # 两个都配了就以它为准（导出库路径听 CLIENT_DB_PATH）。
+    client_db_path: str = ""
 
-    # ---------------- 镜像库（客户端自己的状态） ----------------
-    # 客户端**自己**维护一份 SQLite，只记「这条源消息处理过没有」+ 它的内容指纹。
-    # 增量就靠它，不再依赖后端里的游标：
-    #   不在镜像里 → 新消息，处理
-    #   在、内容没变、已处理 → 跳过（零成本）
-    #   在、**内容变了** → 重新处理（后端幂等会把原来那条任务更新掉）
-    #   在、状态 pending/failed → 重试（这就是恢复队列）
-    # 留空 = 放在源库旁边（`<源库>.mirror.db`）。
+    # ---------------- 状态库 ----------------
+    # 客户端自己维护的 SQLite，记「这条源消息处理过没有」。增量判据就是它。
+    # 留空 = 放在源库旁边（`<源库>.mirror.db`）。**别随便删**：删了会把整个库重读一遍。
     client_mirror_path: str = ""
-    # **回看窗口**（小时）：镜像里已读的消息，最近这段时间内的要重看一遍，用来发现
-    # "内容被编辑过"（重看时比对内容指纹，变了就重抽）。它**不决定"哪些没读过"** ——
-    # 没读过的消息永远会被读到，与时间无关。
-    #
-    # 调大 = 更容易发现很久以前的改动，代价是每轮多读一点（默认 2 小时够用：
-    # QQ 里改一条三天前的老消息极罕见；真要全量重看，用 --since-hours）。
-    client_recheck_overlap_hours: float = 2.0
-    # 回复/引用里，"被引用对象"可能装在这些键上（逗号分隔）。默认值来自
-    # nt_msg_db_util 的群字段文档（47402 与群内序号匹配）。留空 = 用默认那组。
-    client_quote_keys: str = ""
-    # 只有**最近这么多小时**内处理过的消息才接受"被补充"。更早的引用按新消息
-    # 处理：三个月前那条通知的回复，几乎一定是另一件事。
-    client_amendment_max_age_hours: float = 72.0
-    # 要不要把"新消息引用了某条已读消息"当成**补充**（更新那条任务而不是新建一条）。
-    # 关掉就退化成"每条消息各建一条任务"。
-    client_amendment_enabled: bool = True
-    # 强制重新抽取（`--since-hours` 会打开它）。
-    #
-    # 平时会用"后端已经有这条通知"来跳过抽取（省模型的钱）。但那个捷径在一种情况下
-    # 是错的：镜像被删过、而你正好**改过**某条老消息的内容 —— 这时快照是新的、
-    # 后端有旧内容的任务，捷径一开就永远不更新。强制模式关掉捷径，按内容重抽一遍。
-    client_force_recheck: bool = False
 
-    # ---------------- 白名单（**只做收窄，不是开关**） ----------------
-    # 格式与 bot 完全相同（`号码:备注,号码:备注`，备注可省），可以直接复制过来：
+    # ---------------- 白名单（**只做收窄，不是开关**）----------------
+    # 格式与 bot 完全相同（`号码:备注,号码:备注`，备注可省），可以直接复制过来。
     #
-    #   CLIENT_GROUP_WHITELIST=123456789:官方通知群,987654321
-    #   CLIENT_SENDER_WHITELIST=10001:张老师,10002
+    # ⚠️ **语义与 bot 相反**：bot 留空 = 谁都不放行（fail-closed，它是实时入库方）；
+    # 客户端留空 = **全都读**（源库里往往有几百个群，想少扫一点就在这里砍一刀）。
+    # 照抄 bot 会让一个已经跑通的客户端在升级后静默停止入库，所以这里默认不限制。
     #
-    # ⚠️ **语义与 bot 相反，这一点必须看清楚**：
-    #
-    #   bot      ：留空 = 谁都不放行（fail-closed）。它是唯一入库方，空名单意味着
-    #              "还没配好"，所以关死。
-    #   client   ：留空 = **不额外限制**。客户端的过滤条件是**你在后端配的订阅**，
-    #              白名单只是在这个基础上再收窄一层（源库里往往有几百个群，
-    #              先按群/发送者砍一刀能省很多无用扫描）。
-    #
-    # 为什么不做成 fail-closed：照抄 bot 的话，一个已经跑通的客户端在升级后
-    # 会因为"白名单还是空的"而**静默停止入库** —— 而它本来工作得好好的。
-    # 默认值不该让工作正常的部署失效。
-    #
-    # 两个都是"同时满足"（AND）：群在群里白名单 **且** 发送者在发送者白名单。
-    # 号码形状不对会**拒绝启动**（见 `_validate_ids`）。
+    # 两个是「同时满足」（AND）。号码形状不对会**拒绝启动**（见 `_validate_ids`）。
     client_group_whitelist: str = ""
     client_sender_whitelist: str = ""
 
+    # ---------------- 附件 ----------------
+    # 附件字节的搜索根目录（可选）。导出库里通常只有 CDN URL 和 md5；把 NTQQ 的
+    # 附件目录（或你自己导出的目录）配在这里，客户端就能按 md5/文件名找回真字节。
+    client_attachment_root: str = ""
+
     # ---------------- 抽取 ----------------
+    # rule = 只用规则（**完全不发模型请求**，适合先跑通）/ llm = 只信模型
+    # （失败降级到规则并记成"盲区"）/ both = 模型为主、规则兜底（推荐）
     client_extractor: Literal["rule", "llm", "both"] = "rule"
     llm_api_base: str = "https://api.deepseek.com/v1"
     llm_api_key: str = ""
     llm_model: str = "deepseek-chat"
-    llm_timeout: float = 60.0
-    llm_temperature: float = 0.0
-    llm_max_retries: int = 2
-    # 交叉验证：用第二个模型再抽一次，两个模型对截止时间不一致就标 conflict。
-    # 这是"LLM 可出错但不可静默出错"里最贵也最有效的一环，默认关。
-    client_cross_check_enabled: bool = False
-    llm_secondary_api_base: str = ""
-    llm_secondary_api_key: str = ""
-    llm_secondary_model: str = ""
-    # 附件字节要不要喂给模型（VLM）。默认关：源库里通常只有 URL，
-    # 而 QQ CDN 的图片链接几小时就过期，喂进去反而引入"模型在猜图"的风险。
-    client_vlm_enabled: bool = False
-    # 群静默多久算缺口（小时）。和 bot 的 GAP_ALERT_HOURS 是同一套判据。
-    client_gap_alert_hours: float = 2.0
 
     # ---------------- 运行 ----------------
-    # 轮询间隔（秒）。用 --once + 计划任务时这个值不起作用。
+    # 常驻模式的轮询间隔（秒）。用 `--once` + 计划任务时它不起作用。
     client_poll_seconds: int = 300
-    # 只组装不写入（`--dry-run` 也会设它）。写了日志，但一个请求都不发。
-    client_dry_run: bool = False
-    # 全系统统一时区。**必须和 bot 用同一个值** —— 否则同一条"下周三前"在两条
+    client_log_level: str = "INFO"
+    # 全系统统一时区。**必须和 bot / 后端用同一个值** —— 否则同一条"下周三前"在两条
     # 链路上会解析到不同的时刻，而用户没法知道该信哪个。
     #
-    # ⚠️ 字段名和形状都是**照着 bot 抄的**，不能改：`timeparse.py`（从 bot 逐字
-    # 复制）读的是 `get_settings().tz`，而且拿到的必须是 **tzinfo**，
-    # 不是字符串。所以配的是 `DIGEST_TZ`，`tz` 是个派生属性。
+    # ⚠️ 字段名和形状都是照着 bot 抄的：`timeparse.py`（从 bot 逐字复制）读的是
+    # `get_settings().tz`，而且拿到的必须是 **tzinfo**，不是字符串。
     digest_tz: str = "Asia/Shanghai"
-    client_log_level: str = "INFO"
-    client_log_preview_chars: int = 60
 
-
-    # ---------------- 游标（已废弃） ----------------
-    # 这里原本还有一个"把游标存在后端 bot_state 里"的配置（CLIENT_CURSOR_NAMESPACE /
-    # CLIENT_CURSOR_KEY）。镜像库出现之后它被删掉了：水位线表达不了"这一条处理好了
-    # 没有"，也表达不了"这一条的内容变了"，而这两件事恰恰是这套系统最要紧的。
+    # ---------------- 派生 ----------------
 
     @property
     def backend_base(self) -> str:
         return self.backend_base_url.rstrip("/")
-
-    # ---------------- 白名单 ----------------
 
     @property
     def group_whitelist_map(self) -> dict[str, str]:
@@ -307,9 +193,6 @@ class Settings(BaseSettings):
         指纹取**解析并排序之后**的结果，而不是原始字符串：`a,b` 和 `b,a`、
         或者备注改了但号码没改，都不算"白名单变了"，不该触发一次全量重看。
         """
-        import hashlib
-        import json
-
         normalized = json.dumps(
             {
                 "groups": sorted(self.group_whitelist_map),
@@ -358,15 +241,6 @@ class Settings(BaseSettings):
         return source.with_name(source.name + ".mirror.db")
 
     @property
-    def quote_keys(self) -> tuple[str, ...]:
-        raw = (self.client_quote_keys or "").replace("，", ",").strip()
-        if not raw:
-            from .source.ntmsg import DEFAULT_QUOTE_KEYS
-
-            return tuple(DEFAULT_QUOTE_KEYS)
-        return tuple(part.strip() for part in raw.split(",") if part.strip())
-
-    @property
     def tz(self) -> tzinfo:
         """`DIGEST_TZ` 对应的 tzinfo。**名字和返回类型都必须与 bot 一致** ——
         从 bot 逐字复制的 `timeparse.py` 直接把它喂给 `astimezone()`。
@@ -398,7 +272,7 @@ class Settings(BaseSettings):
 
     @property
     def ntmsg_pipeline_enabled(self) -> bool:
-        """要不要自己做"解密 + 导出"（配了 `CLIENT_NT_MSG_DB` 才需要）。"""
+        """要不要自己做"剥头 + 解密 + 导出"（配了 `CLIENT_NT_MSG_DB` 才需要）。"""
         return bool((self.client_nt_msg_db or "").strip())
 
     @property
@@ -429,37 +303,103 @@ class Settings(BaseSettings):
         return not self.client_token or self.client_token.startswith("xc_")
 
 
+# ==========================================================================
+# 写死的参数（以前是 40 多个配置项）
+#
+# 想改就改这里 —— 它们是**代码的一部分**，改完要重新部署。这样做的理由：这些值
+# 要么从来没被改对过、要么改错之后的现象极其难查（例如把 kdf_iter 从 4000 改成
+# 别的，症状是"解出来的库全是乱码"）。留在 `.env` 里只会让用户以为改了就生效。
+# ==========================================================================
+
+# ---- 一轮读多少 ----
+# 一次 SQL 取多少条（分块大小）。
+BATCH_SIZE = 200
+# 一轮最多处理多少条。第一轮会把导出库里所有群消息过一遍（几十万条），
+# 所以积压是分多轮读完的。**它只决定一轮读多少，不决定读哪些** ——
+# "读哪些"的判据是镜像里的已读标记（不看时间）。
+MAX_MESSAGES_PER_CYCLE = 500
+
+# ---- 附件 ----
+# 找不到本地字节时只留 CDN 地址（可能是死链）。另一种做法是干脆不记，但
+# "记下来但打不开"比"什么都不留"好排查。
+
+# ---- 缺口告警 ----
+# 群静默多久算缺口（小时）。和 bot 的 GAP_ALERT_HOURS 是同一套判据。
+GAP_ALERT_HOURS = 2.0
+
+# ---- 后端请求 ----
+BACKEND_TIMEOUT = 20.0
+# 写接口失败后的重试次数（不含首次），退避 1s/2s/4s
+BACKEND_MAX_RETRIES = 3
+
+# ---- 模型 ----
+LLM_TIMEOUT = 60.0
+LLM_TEMPERATURE = 0.0
+LLM_MAX_RETRIES = 2
+# 附件字节要不要喂给模型（VLM）。默认关：源库里通常只有 URL，而 QQ CDN 的图片
+# 链接几小时就过期，喂进去反而引入"模型在猜图"的风险。想开就把这里改成 True。
+VLM_ENABLED = False
+# 交叉验证：用第二个模型再抽一次，两个模型对截止时间不一致就标 conflict。
+# 这是"LLM 可出错但不可静默出错"里最贵也最有效的一环。要开就填下面两个值
+# （api_base 留空 = 用主模型那套地址与密钥）。
+CROSS_CHECK_ENABLED = False
+SECONDARY_LLM_MODEL = ""
+SECONDARY_LLM_API_BASE = ""
+SECONDARY_LLM_API_KEY = ""
+
+# ---- 日志 ----
+# 日志里预览正文的截断长度（日志里打印整条消息没有意义）。
+LOG_PREVIEW_CHARS = 60
+
+# ---- nt_msg.db：剥头 + 解密 + 导出（上游 1.decrypt.py / 3.export.py 的常量）----
+# nt_msg.db 前面那段 QQ 自定义头的长度（固定 1024）。
+NT_MSG_HEADER_SIZE = 1024
+# 下面几个是上游 1.decrypt.py 用的 PRAGMA 值，**不要随便改**：改了就等于换了一套
+# 加密参数，只有你自己造过库才需要（改错的症状是"解出来的库全是乱码"）。
+NT_MSG_PAGE_SIZE = 4096
+NT_MSG_KDF_ITER = 4000
+NT_MSG_KDF_ALGORITHM = "sha512"
+NT_MSG_HMAC_ALGORITHM = "sha1"
+# 每批从加密库读多少行（遇坏页会自动缩小，成功后再放大回来）。
+DECRYPT_BATCH_SIZE = 5000
+# 解完让 SQLite 自己查一遍明文库（quick / full / off）。只影响报告。
+DECRYPT_INTEGRITY = "quick"
+# 允许多少行因为坏页被跳过，-1 = 不限（上游行为）。
+#
+# 坏页真实存在（上游为此专门写了"重连 + 缩小批次 + 跳过坏 rowid"）。容忍是为了
+# 不因为一个坏页卡死整天，但**每一次跳过都会打 ERROR 级日志并记进报告** ——
+# 被跳过的行意味着那几条消息永远进不来，这必须让人看见。
+DECRYPT_MAX_SKIPS = -1
+# 导出：每批写多少行。
+EXPORT_BATCH = 2000
+# 要不要连私聊一起导（和上游 3.export.py 一样两张表都导）。
+EXPORT_INCLUDE_C2C = True
+# 导出**永远全量**（不做增量）。按时间过滤会让"时间戳没变、内容变了"的旧消息
+# 永远不进导出库，那一层一层往上看就都看不见它。全量代价：实测 77 万行约 45 秒。
+EXPORT_OVERLAP_SECONDS = 3600
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
 
 
-# 以前存在、现在**已经没有任何作用**的键，连同"现在该用什么"。
-#
-# 为什么要在启动时专门查一遍：`extra="ignore"` 意味着用户 `.env` 里留着一个淘汰的键
-# 不会报错 —— 于是"我明明配了"和"这个键根本不生效"长得一模一样。客户端的判据从
-# 时间窗口换成"镜像里的已读标记"时，一台已经跑着的机器上正好留着旧键，这就是一个
-# 现成的例子。
-REMOVED_ENV_KEYS: dict[str, str] = {
-    "CLIENT_INITIAL_LOOKBACK_HOURS": (
-        "读哪些消息现在由镜像里的已读标记决定（不看时间）；"
-        "时间窗口只剩 CLIENT_RECHECK_OVERLAP_HOURS 这个回看窗口"
-    ),
-    "CLIENT_CURSOR_NAMESPACE": "后端游标已被镜像库取代（CLIENT_MIRROR_PATH）",
-    "CLIENT_CURSOR_KEY": "后端游标已被镜像库取代（CLIENT_MIRROR_PATH）",
-    "WEB_API_TOKEN": "网页端不再用单独的令牌；客户端用 CLIENT_TOKEN",
-}
+# 我们自己用的环境变量前缀。`.env` 里这些前缀的键**必须**是上面某个字段，
+# 否则就是拼错了或者早就被删了 —— 两种都不该悄悄过去。
+ENV_PREFIXES = ("CLIENT_", "LLM_", "BACKEND_")
+# 这几个是整份 `.env` 里直接按名字写的（不带前缀）。
+ENV_EXACT = ("DIGEST_TZ",)
 
 
-def stale_env_keys(env_file: Path | str | None = None) -> list[tuple[str, str]]:
-    """`(键, 现在该用什么)` —— `.env` 里那些已经失效的配置。
+def unknown_env_keys(env_file: Path | str | None = None) -> list[str]:
+    """`.env` 里写了、但**不是配置项**的键。
 
     `env_file` 不传就用 `Settings` 配的那个（也就是 `BASE_DIR/.env`）；测试会传一个
     临时文件进来。文件不存在、或者 `env_file` 被显式关掉（测试里的隔离）都返回空表。
 
-    只报 `REMOVED_ENV_KEYS` 里那些**确定失效**的键，不报"不认识的键"：`.env` 里放
-    别的工具（Docker 的宿主目录变量之类）用的东西是合理的，报出来只会制造噪音。
+    为什么必须报出来：`extra="ignore"` 让它们在启动时**静默失效** —— 用户按旧文档
+    配了 `CLIENT_XXX`，日志里一切正常，而那个值根本没被读。判断依据就是"它是不是
+    一个字段"，所以不需要另外维护一份"已废弃的键"名单（那种名单迟早会和代码漂移）。
     """
     if env_file is None:
         configured = Settings.model_config.get("env_file")
@@ -469,13 +409,17 @@ def stale_env_keys(env_file: Path | str | None = None) -> list[tuple[str, str]]:
     path = Path(env_file)
     if not path.exists():
         return []
-    out: list[tuple[str, str]] = []
+    fields = {name.upper() for name in Settings.model_fields}
+    out: list[str] = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key = line.split("=", 1)[0].strip().upper()
-        if key in REMOVED_ENV_KEYS:
-            out.append((key, REMOVED_ENV_KEYS[key]))
+        if key in fields:
+            continue
+        # 只报"看起来是我们自己的键"：`.env` 里放别的工具用的东西是合理的，
+        # 报出来只会制造噪音（Docker 的宿主目录变量之类）。
+        if key in ENV_EXACT or key.startswith(ENV_PREFIXES):
+            out.append(key)
     return out
-

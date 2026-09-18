@@ -33,8 +33,6 @@ if str(BASE_DIR) not in sys.path:
 import sqlcipher3.dbapi2 as sc  # noqa: E402
 
 from app.ntmsg_db import (  # noqa: E402
-    REPLY_SEQ_COLUMN,
-    SEQ_COLUMN,
     DecryptError,
     ExportError,
     decrypt_database,
@@ -48,7 +46,6 @@ from app.ntmsg_db.prepare import prepare_databases, read_key, resolve_paths  # n
 from app.source.ntmsg import (  # noqa: E402
     SourceDatabase,
     attachments_from_content,
-    quote_ref_from_content,
 )
 from app.utils import sqlite_uri  # noqa: E402
 from msgdb.proto import c2c_40800_pb2 as pb  # noqa: E402
@@ -524,11 +521,10 @@ def test_export() -> None:
         fixture.encrypted, fixture.clear, fixture.plain, KEY,
         tables=["group_msg_table", "c2c_msg_table"],
     )
-    report = export_database(fixture.plain, fixture.export, include_c2c=True, resume=False)
+    report = export_database(fixture.plain, fixture.export, include_c2c=True)
     check(report.written_rows.get("group_messages") == fixture.rows, f"群消息 {report.written_rows}")
     check(report.written_rows.get("c2c_messages") == fixture.rows, f"私聊 {report.written_rows}")
     check(report.failed_rows == 0, f"没有转换失败（{report.last_error}）")
-    check(report.seq_added and report.seq_filled == fixture.rows, "序号列补上了")
     check(
         report.parse_status.get("typed", 0) >= fixture.rows - 2,
         f"解析状态分布：{report.parse_status}",
@@ -540,8 +536,8 @@ def test_export() -> None:
         check(
             {"msg_id", "timestamp", "direction", "sender_uid", "sender_qq", "group_id",
              "group_qq", "msg_type", "subtype", "content_type", "text", "parse_status",
-             "content", SEQ_COLUMN, REPLY_SEQ_COLUMN} <= columns,
-            f"列齐（上游的 + 我们补的两列）：{sorted(columns)}",
+             "content"} <= columns,
+            f"列齐（就是上游那套，不多不少）：{sorted(columns)}",
         )
         check(
             {"c2c_messages", "c2c_messages_fts", "group_messages_fts"} <= {
@@ -553,7 +549,6 @@ def test_export() -> None:
         check(row["text"] == "【教务处】下周三前提交开题报告", f"正文：{row['text']!r}")
         check(row["timestamp"] == 1_700_000_000, "时间戳（秒）")
         check(row["sender_qq"] == 20001 and row["group_id"] == "894880656", "发送者/群号")
-        check(row[SEQ_COLUMN] == 1, f"补的 {SEQ_COLUMN} 有值（{row[SEQ_COLUMN]}）")
         content = json.loads(row["content"])
         check(content["type"] == "msg_body", f"content 是上游形状：{content['type']}")
         check(
@@ -562,26 +557,25 @@ def test_export() -> None:
         )
         bad = conn.execute('SELECT * FROM group_messages WHERE msg_id=1003').fetchone()
         check(bad["parse_status"] == "invalid" and bad["text"] is None, "读不通的行照样入库")
-        reply = conn.execute('SELECT * FROM group_messages WHERE msg_id=1002').fetchone()
-        check(reply[REPLY_SEQ_COLUMN] == 1, f"被回复序号：{reply[REPLY_SEQ_COLUMN]}")
 
-    section("导出：幂等与增量")
+    section("导出：幂等与全量")
     check(watermark(fixture.export) == 1_700_000_000 + fixture.rows - 1, "水位线是最新时间戳")
-    full_again = export_database(fixture.plain, fixture.export, resume=False)
-    check(full_again.written_rows.get("group_messages") == fixture.rows, "全量重导一遍仍是同样行数")
+    full_again = export_database(fixture.plain, fixture.export)
+    check(full_again.written_rows.get("group_messages") == fixture.rows, "再导一遍仍是同样行数")
     with closing(sqlite3.connect(sqlite_uri(fixture.export, "ro"), uri=True)) as conn:
         count = conn.execute("SELECT count(*) FROM group_messages").fetchone()[0]
     check(count == fixture.rows, f"重导后总行数不变（幂等）：{count}")
 
+    # 源库多了一行 → 全量重导必须把它带进来（**默认就是全量**，不做增量过滤）
     with closing(sqlite3.connect(str(fixture.plain))) as conn:
         conn.execute(
             "INSERT INTO group_msg_table VALUES (2000, 99, 2, 0, 0, 'u_z', '894880656', 7, 20009,"
             " 1700000900, NULL, 0, 0, 894880656)"
         )
         conn.commit()
-    inc = export_database(fixture.plain, fixture.export, resume=True, overlap_seconds=0)
-    # 起点是 `>= 水位线`，所以水位线那一秒的旧行会再读一遍（刻意的：同秒后到的消息不能漏）
-    check(inc.written_rows.get("group_messages") == 2, f"增量只处理边界 + 新行：{inc.written_rows}")
+    inc = export_database(fixture.plain, fixture.export)
+    check(inc.written_rows.get("group_messages") == fixture.rows + 1,
+          f"全量重导把新行带进来：{inc.written_rows}")
     with closing(sqlite3.connect(sqlite_uri(fixture.export, "ro"), uri=True)) as conn:
         count = conn.execute("SELECT count(*) FROM group_messages").fetchone()[0]
         newest = conn.execute("SELECT max(msg_id) FROM group_messages").fetchone()[0]
@@ -589,7 +583,7 @@ def test_export() -> None:
 
     section("导出：关掉 c2c / 源库不对")
     only_group = export_database(
-        fixture.plain, WORK / "exp" / "group_only.db", include_c2c=False, resume=False
+        fixture.plain, WORK / "exp" / "group_only.db", include_c2c=False
     )
     check("c2c_messages" not in only_group.written_rows, f"没有导 c2c：{only_group.written_rows}")
     empty = WORK / "exp" / "empty.db"
@@ -638,46 +632,32 @@ def test_reader() -> None:
     check(got and got[0].get("size") == 737226, f"字符串形式的 filesize：{got}")
     check(got and got[0].get("ext") == ".pdf", "扩展名补上点")
 
-    # 引用：优先 reply_msg_seq（47402），而不是 reply_msg_id（47401，只是候选）
+    # 引用相关的字段（47402 之类）现在**不解析**了：那条"补充/改期"的功能已经删掉。
+    # 这里只钉住"不解析也不会把附件/正文读坏"。
+    section("读取器：引用字段不再解析（功能已删）")
     reply = MessageToDict(reply_segment(4321), preserving_proto_field_name=True)
-    reply["reply_msg_id"] = "999"  # 同时存在时，必须选 47402
     check(
-        quote_ref_from_content({"type": "msg_body", "segments": [reply]}) == "4321",
-        "reply_msg_seq 优先于 reply_msg_id",
+        attachments_from_content({"type": "msg_body", "segments": [reply]}) == [],
+        "引用段里没有媒体 → 不产出附件",
     )
-    check(quote_ref_from_content({"type": "msg_body", "segments": [{"content_type": 1, "text": "x"}]}) is None,
-          "没有引用关系时返回 None")
-    check(quote_ref_from_content({"reply_source_record_id": "47422"}) == "47422",
-          "只有 47422 时也能取到（排在最后）")
 
     section("读取器：零值不能被当成「有值」")
-    # 这条踩到过：`SELECT 40850` 没加引号 → 每行都变成 40850 这个数字
     fixture = Fixture(WORK / "reader")
     decrypt_database(fixture.encrypted, fixture.clear, fixture.plain, KEY,
                      tables=["group_msg_table"])
-    export_database(fixture.plain, fixture.export, include_c2c=False, resume=False)
+    export_database(fixture.plain, fixture.export, include_c2c=False)
     db = SourceDatabase(fixture.export)
     info = db.inspect()
     check(info["rows"] == fixture.rows, f"inspect：{info['rows']} 行")
-    check(db.seq_column() == SEQ_COLUMN, f"序号列：{db.seq_column()}")
-    messages = db.fetch_since(0, "", limit=50)
+    messages = db.iter_unread(WORK / "reader" / "no-mirror.db", limit=50)
+    messages = list(messages)
     check(len(messages) == fixture.rows, f"取到 {len(messages)} 条")
     by_id = {m.msg_id: m for m in messages}
     plain_one = by_id["1000"]
-    check(plain_one.quote_ref is None, f"普通消息没有引用关系（实际 {plain_one.quote_ref!r}）")
-    check(plain_one.seq == "1", f"群内序号：{plain_one.seq}")
     check(plain_one.text.startswith("【教务处】"), "正文")
-    check(by_id["1002"].quote_ref == "1", f"引用目标：{by_id['1002'].quote_ref}")
     check(by_id["1001"].attachments, f"图片附件：{by_id['1001'].attachments}")
     check(by_id["1001"].attachments[0].get("url") == "http://cdn.example/x.png", "附件 URL")
     check(by_id["1003"].parse_status == "invalid", "读不通的行标了 invalid")
-
-    section("读取器：序号命中多条时不敢认")
-    resolved, matches = db.resolve_seq_detail("894880656", "1")
-    check(matches > 1, f"夹具里 (群, 序号=1) 对应多条消息（{matches}）")
-    check(resolved is None, "**不猜**：命中多条时返回 None")
-    check(db.resolve_seq("894880656", "3") == "1002" or db.resolve_seq("894880656", "3") is None,
-          "只命中一条时才给出 msg_id")
 
 
 # ---------------------------------------------------------------------------
@@ -690,7 +670,7 @@ def test_prepare() -> None:
     from app.config import Settings
     from tests._hermetic import isolate_settings
 
-    # 这个文件不读任何环境变量；本机 `.env` 里的 CLIENT_EXPORT_* 会改变 prepare 的行为。
+    # 这个文件不读任何环境变量；本机 `.env` 会改变 prepare 的行为。
     isolate_settings()
 
     fixture = Fixture(WORK / "prep", rows=4)
@@ -704,7 +684,7 @@ def test_prepare() -> None:
     check(source == fixture.encrypted and clear == fixture.encrypted.with_name("nt_msg_clear.db"),
           f"路径推导：{clear.name}")
     check(plain.name == "nt_msg_plain.db" and export.name == "nt_msg_export.db",
-          "中间产物与导出库默认都在 nt_msg.db 旁边")
+          "中间产物与导出库都固定在 nt_msg.db 旁边（不再配路径）")
     check(read_key(settings) == KEY, "密钥读出来了")
     keyfile = WORK / "prep" / "key.txt"
     keyfile.write_text(KEY + "\n", encoding="utf-8")
@@ -719,9 +699,6 @@ def test_prepare() -> None:
     again = prepare_databases(settings)
     check(not again.decrypted and not again.exported, "没变化时两步都跳过（只 stat 文件）")
 
-    forced = prepare_databases(settings, force=True)
-    check(forced.decrypted and forced.exported, "force=True 会重跑")
-
     stat = fixture.encrypted.stat()
     import os
 
@@ -735,17 +712,14 @@ def test_prepare() -> None:
     check(not report_off.enabled, "没配 nt_msg.db 时是空操作")
     check(report_off.export_path == off.resolved_db_path, "并把源库指回 CLIENT_DB_PATH")
     missing = settings.model_copy(update={"client_nt_msg_db": str(WORK / "nope.db")})
-    expect_raises(DecryptError, lambda: prepare_databases(missing, force=True),
+    expect_raises(DecryptError, lambda: prepare_databases(missing),
                   "源库不存在 → 明确报错", contains="nt_msg.db")
     no_key = settings.model_copy(update={"client_nt_msg_key": "", "client_nt_msg_key_file": ""})
-    expect_raises(DecryptError, lambda: prepare_databases(no_key, force=True),
+    expect_raises(DecryptError, lambda: prepare_databases(no_key),
                   "没配密钥 → 明确报错", contains="CLIENT_NT_MSG_KEY")
     wrong = settings.model_copy(update={"client_nt_msg_key": "definitely-wrong"})
-    expect_raises(DecryptError, lambda: prepare_databases(wrong, force=True),
+    expect_raises(DecryptError, lambda: prepare_databases(wrong),
                   "密钥错 → 明确报错", contains="密钥")
-    bad_tables = settings.model_copy(update={"client_decrypt_tables": "no_such_table"})
-    expect_raises(DecryptError, lambda: prepare_databases(bad_tables, force=True),
-                  "CLIENT_DECRYPT_TABLES 写了不存在的表 → 明确报错", contains="no_such_table")
 
 
 def main() -> int:

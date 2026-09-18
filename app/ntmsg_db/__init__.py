@@ -39,8 +39,6 @@ from .decrypt import (
     strip_header,
 )
 from .export import (
-    REPLY_SEQ_COLUMN,
-    SEQ_COLUMN,
     ExportError,
     ExportReport,
     export_database,
@@ -56,8 +54,6 @@ __all__ = [
     "ExportError",
     "ExportReport",
     "PrepareReport",
-    "REPLY_SEQ_COLUMN",
-    "SEQ_COLUMN",
     "TableReport",
     "decrypt_database",
     "export_database",

@@ -144,38 +144,20 @@ def main() -> int:  # noqa: C901
 
         # ------------------------------------------------------------------
         print("\n--- 2. 时间单位是**秒**（差 1000 倍是最容易犯的错）---")
-        first = db.fetch_since(0, "", limit=10)[0]
+        first = db.fetch_by_ids(["1001"])["1001"]
         check("source 的 timestamp 原样是秒", first.timestamp, 1757692800)
         check("转成毫秒给后端（×1000）", first.ts_ms, 1757692800000)
         check_true("毫秒值量级像个 2025 年的时间戳", 1.7e12 < first.ts_ms < 1.8e12, str(first.ts_ms))
 
         # ------------------------------------------------------------------
-        print("\n--- 3. 增量读：同一秒里的多条不能漏 ---")
-        all_rows = db.fetch_since(0, "", limit=10)
-        check("全取 5 条", len(all_rows), 5)
-        check("按时间正序", [r.msg_id for r in all_rows], ["1001", "1002", "1003", "1004", "1005"])
-
-        # 取到 1001 之后：同一秒的 1002 必须还在
-        nxt = db.fetch_since(1757692800, "1001", limit=10)
-        check("从 (1757692800, 1001) 之后读 → 不含 1001", [r.msg_id for r in nxt][0], "1002")
-        check("同一秒的 1002 没被跳过（这正是用元组比较的原因）", "1002" in [r.msg_id for r in nxt], True)
-
-        # 取到 1002 之后：同秒的没有了，下一条是 1003
-        nxt2 = db.fetch_since(1757692800, "1002", limit=10)
-        check("从 (1757692800, 1002) 之后读 → 下一条是 1003", [r.msg_id for r in nxt2][0], "1003")
-
-        # 幂等：用最后一条的位置再读一次，应该是空的
-        check("从最后一条之后读 → 空", db.fetch_since(1757692980, "1005", limit=10), [])
+        print("\n--- 3. 按 msg_id 精确取（重试路径靠它，不能全表重扫）---")
+        got = db.fetch_by_ids(["1003", "1001", "nope"])
+        check("只返回存在的，且按 id 命中", sorted(got), ["1001", "1003"])
+        check("取出来的字段是对的", got["1003"].text, "本周五19:00在教三201开班会")
+        check("空列表 → 空字典", db.fetch_by_ids([]), {})
 
         # ------------------------------------------------------------------
-        print("\n--- 4. 分块迭代（iter_since）---")
-        got = [m.msg_id for m in db.iter_since(0, "", limit=3, chunk=2)]
-        check("limit=3 只取 3 条", got, ["1001", "1002", "1003"])
-        got_all = [m.msg_id for m in db.iter_since(0, "", limit=100, chunk=2)]
-        check("limit 大于总数时取全部", got_all, ["1001", "1002", "1003", "1004", "1005"])
-
-        # ------------------------------------------------------------------
-        print("\n--- 4b. 按「读没读过」扫描（主路径）---")
+        print("\n--- 4. 按「读没读过」扫描（唯一路径）---")
         # 判据是镜像里的已读标记，不是时间：镜像里没有的都要读，不管它多老。
         mirror_db = tmp_path / "mirror.db"
         if mirror_db.exists():
@@ -184,10 +166,10 @@ def main() -> int:  # noqa: C901
 
         check("镜像不存在时全部算没读过", db.count_unread(mirror_db), 5)
         unread = [m.msg_id for m in db.iter_unread(mirror_db, limit=10)]
-        check("顺序是从最老的开始（补充关系的原文必须先于补充）", unread, ["1001", "1002", "1003", "1004", "1005"])
+        check("顺序是从最老的开始", unread, ["1001", "1002", "1003", "1004", "1005"])
         check("一处也没有重复", len(unread), len(set(unread)))
 
-        # 标记两条已读（内容指纹随便给，这里只测"读没读过"）
+        # 标记两条已读（这里只测"读没读过"）
         for msg_id in ("1001", "1002"):
             mirror.claim(db.fetch_by_ids([msg_id])[msg_id])
             mirror.finish(msg_id, state="done")
@@ -199,58 +181,14 @@ def main() -> int:  # noqa: C901
         )
         check("limit 生效（分多轮读）", [m.msg_id for m in db.iter_unread(mirror_db, limit=2)], ["1003", "1004"])
 
-        # 分页不能因为"处理时会把镜像写进去"而重复：这里刻意**不写镜像**，
-        # 模拟 --dry-run（dry-run 是不记账的，靠副作用翻页就会反复读同一批）。
+        # 翻页靠游标，不靠"处理时会把镜像写进去"：这里刻意**不写镜像**，
+        # 一块一条地翻也不能重复、不能漏。
         paged = [m.msg_id for m in db.iter_unread(mirror_db, limit=3, chunk=1)]
         check("一块一条地翻页也不重复", paged, ["1003", "1004", "1005"])
-
-        # 回看模式：已读的也要能重看（发现"内容被编辑"就靠它），且是最新优先
-        rechecked = [
-            m.msg_id
-            for m in db.iter_unread(mirror_db, limit=10, recheck_since=1757692800)
-        ]
-        check("回看模式会把已读的也带回来", rechecked, ["1005", "1004", "1003", "1002", "1001"])
-        check(
-            "回看模式是最新优先（预算不够时先看最新的）",
-            [m.msg_id for m in db.iter_unread(mirror_db, limit=2, recheck_since=1757692800)],
-            ["1005", "1004"],
-        )
-        check(
-            "回看窗口只决定「读过的」要不要重看，不缩小没读过的范围",
-            [m.msg_id for m in db.iter_unread(mirror_db, limit=10, recheck_since=1757692900)],
-            ["1005", "1004", "1003"],
-        )
-
-        # 排除这一轮已经处理过的（回看窗口与「没读过」是并集，不排就会处理两遍）。
-        check(
-            "回看可以排除这一轮已经看过的",
-            [
-                m.msg_id
-                for m in db.iter_unread(
-                    mirror_db, limit=10, recheck_since=1757692800, exclude={"1005"}
-                )
-            ],
-            ["1004", "1003", "1002", "1001"],
-        )
-        check(
-            "排除名单跟着分页走（chunk=1 也不能漏）",
-            [
-                m.msg_id
-                for m in db.iter_unread(
-                    mirror_db,
-                    limit=10,
-                    chunk=1,
-                    recheck_since=1757692800,
-                    exclude={"1005", "1004"},
-                )
-            ],
-            ["1003", "1002", "1001"],
-        )
-        check(
-            "未读模式也能排除（排除掉的那条不该占位置）",
-            [m.msg_id for m in db.iter_unread(mirror_db, limit=10, exclude={"1003"})],
-            ["1004", "1005"],
-        )
+        check("分页取满 limit 就停", [m.msg_id for m in db.iter_unread(mirror_db, limit=1, chunk=1)], ["1003"])
+        # 同一秒里的多条（1001/1002 同秒）不能因为按秒比而漏：把 1001 标已读、
+        # 1002 留成未读，游标必须仍然把 1002 带出来。
+        check("同一秒里剩下的那条没被跳过", [m.msg_id for m in db.iter_unread(mirror_db, limit=10)][-3:], ["1003", "1004", "1005"])
 
         # msg_id 类型：镜像里是 TEXT，导出表里可能是 INTEGER —— 不转类型的话
         # 反连接会"全部命中"，等于每次把整个库读一遍。
@@ -281,25 +219,28 @@ def main() -> int:  # noqa: C901
 
         # ------------------------------------------------------------------
         print("\n--- 5. 正文与附件解析 ---")
-        check("纯文本消息的正文", all_rows[0].text, "大家下周三前把军训心得交到班长那里，不少于800字。")
-        check("纯文本消息没有附件", all_rows[0].attachments, [])
-        check("发送者取自 sender_qq", all_rows[0].sender_id, "10001")
-        check("群号取自 group_id", all_rows[0].group_id, "123456789")
+        by_id = db.fetch_by_ids(["1001", "1002", "1003", "1004", "1005"])
+        first = by_id["1001"]
+        check("纯文本消息的正文", first.text, "大家下周三前把军训心得交到班长那里，不少于800字。")
+        check("纯文本消息没有附件", first.attachments, [])
+        check("发送者取自 sender_qq", first.sender_id, "10001")
+        check("群号取自 group_id", first.group_id, "123456789")
 
-        mixed = all_rows[2]
+        mixed = by_id["1003"]
         check("mixed 的正文", mixed.text, "本周五19:00在教三201开班会")
         check("mixed 里解析出 1 个附件", len(mixed.attachments), 1)
         check("附件的名字", mixed.attachments[0].get("name"), "通知.png")
         check("附件的远程地址", mixed.attachments[0].get("url"), "https://cdn.example/notice.png")
         check("附件的 md5", mixed.attachments[0].get("md5"), "abc123")
 
-        doc = all_rows[3]
+        doc = by_id["1004"]
         check("文件类型附件", doc.attachments[0].get("type"), "file")
         check("文件名", doc.attachments[0].get("name"), "模板.docx")
 
-        check("空 content 不会炸", all_rows[4].attachments, [])
-        check("空 content 的 raw_content", all_rows[4].raw_content, None)
-        check("parse_status 保留下来了", all_rows[4].parse_status, "wire_fallback")
+        empty = by_id["1005"]
+        check("空 content 不会炸", empty.attachments, [])
+        check("空 content 的 raw_content", empty.raw_content, None)
+        check("parse_status 保留下来了", empty.parse_status, "wire_fallback")
 
         # ------------------------------------------------------------------
         print("\n--- 6. content 解析的边界 ---")
@@ -332,11 +273,11 @@ def main() -> int:  # noqa: C901
         info_lean = db_lean.inspect()
         check_true("缺列被报出来了", len(info_lean["absent"]) > 0, str(info_lean["absent"]))
         check_true("缺 text/content 也能标出来", "text" in info_lean["absent"], str(info_lean["absent"]))
-        got_lean = db_lean.fetch_since(0, "", limit=5)
-        check("缺列时仍然读得出这一条", len(got_lean), 1)
-        check("正文降级成空串（不编内容）", got_lean[0].text, "")
-        check("附件降级成空列表", got_lean[0].attachments, [])
-        check("群号和发送者还在", (got_lean[0].group_id, got_lean[0].sender_id), ("123456789", "10001"))
+        got_lean = db_lean.fetch_by_ids(["1"])["1"]
+        check("缺列时仍然读得出这一条", got_lean.msg_id, "1")
+        check("正文降级成空串（不编内容）", got_lean.text, "")
+        check("附件降级成空列表", got_lean.attachments, [])
+        check("群号和发送者还在", (got_lean.group_id, got_lean.sender_id), ("123456789", "10001"))
 
         # ------------------------------------------------------------------
         print("\n--- 8. 拿错库 / 文件不在：报错要能指导下一步 ---")

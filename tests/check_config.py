@@ -10,14 +10,17 @@
 "根本没生效"长得一模一样。
 
 这个坑在开发时真踩到过一次（`CLIENT_TOKEN` 被忽略，客户端以未认证身份跑，
-全部 401），所以这里把它钉成三道断言：
+全部 401），所以这里把它钉成几道断言：
 
-  1. `.env.example` 里的每个键都能对应到一个字段（否则用户配了等于白配）；
-  2. 每个字段都**真的被代码读过**（否则它是个骗人的开关）；
-  3. 白名单的形状校验、时区类型、镜像库默认路径这些"配置派生出来的东西"是对的。
+  1. **配置项不超过 20 个**（54 个太多了：用户要读 54 行才知道自己在配什么，
+     而且配错一个不影响启动、只影响行为 —— 那是最难查的一类故障）；
+  2. `.env.example` 里的每个键都能对应到一个字段（否则用户配了等于白配）；
+  3. 每个字段都**真的被代码读过**（否则它是个骗人的开关）；
+  4. 砍掉的那些键**不许再回来**（要高级行为就去改 `app/config.py` 的常量）；
+  5. 白名单形状校验、时区类型、镜像库默认路径这些"派生出来的东西"是对的。
 
-外加一条：已经不存在的旧配置（比如那个被镜像库取代的后端游标）不许再被引用 ——
-否则用户按旧文档配了，会以为是生效的。
+第 4 条的另一面是 `unknown_env_keys()`：用户 `.env` 里留着非配置项的键时，
+启动会警告一次 —— `extra="ignore"` 让它们静默失效，那和"配了"长得一模一样。
 """
 
 from __future__ import annotations
@@ -27,11 +30,18 @@ import sys
 from pathlib import Path
 
 from app.config import (
+    BATCH_SIZE,
     BASE_DIR,
-    REMOVED_ENV_KEYS,
+    CROSS_CHECK_ENABLED,
+    EXPORT_OVERLAP_SECONDS,
+    MAX_MESSAGES_PER_CYCLE,
+    NT_MSG_HEADER_SIZE,
+    NT_MSG_KDF_ITER,
+    NT_MSG_PAGE_SIZE,
+    VLM_ENABLED,
     ConfigError,
     Settings,
-    stale_env_keys,
+    unknown_env_keys,
 )
 from tests._hermetic import isolate_settings
 
@@ -44,16 +54,6 @@ ENV_EXAMPLE = BASE_DIR / ".env.example"
 # 临时文件放仓库里（`.tmp-test/`，已 gitignore），不用系统 temp —— 文件沙箱下
 # 系统 temp 在清理阶段会被拒绝 chmod，那会让一个全通过的测试以看不懂的错误收场。
 SCRATCH = BASE_DIR / ".tmp-test"
-
-# 只通过命令行开关设置、**故意不写进 .env.example** 的字段。
-# 写进去会误导：这两个是 `--dry-run` / `--since-hours` 的行为开关，
-# 放到配置文件里等于鼓励用户长期开着"试跑模式"。
-CLI_ONLY_FIELDS = {"client_dry_run", "client_force_recheck"}
-
-# 已经从配置里删掉、且不允许再被引用的键（留着会让人以为它还生效）。
-# 名单本身是**运行时也要用的**（`app/config.stale_env_keys()` 在启动时警告一次），
-# 所以这里从 app 里读，而不是各写一份 —— 两份名单迟早会漂移。
-REMOVED_KEYS = tuple(REMOVED_ENV_KEYS)
 
 fails: list[str] = []
 total = 0
@@ -86,32 +86,27 @@ def app_sources() -> dict[str, str]:
     return {p.name: p.read_text(encoding="utf-8") for p in APP_DIR.rglob("*.py")}
 
 
-def strip_comments(text: str) -> str:
-    """去掉整行注释。
-
-    这一步是为了不把**说明性的注释**误判成"还在引用旧配置"：config.py 里就有一段
-    注释在解释"这两个键已经删掉了"，那正是我们想要的文档，不是残留引用。
-    """
-    return "\n".join(
-        line for line in text.splitlines() if not line.lstrip().startswith("#")
-    )
-
-
 def main() -> int:  # noqa: C901
     fields = list(Settings.model_fields)
     field_set = set(fields)
 
     # ------------------------------------------------------------------
-    print("--- 1. .env.example 的每个键都要能对应到字段 ---")
+    print("--- 1. 配置项只有十几个，且 .env.example 与字段严格对应 ---")
     keys = env_keys()
-    check_true(".env.example 不是空的", len(keys) > 20, f"{len(keys)} 个键")
-    unknown = sorted(k for k in keys if k.lower() not in field_set)
+    check_true(".env.example 不是空的", len(keys) >= 10, f"{len(keys)} 个键")
+    # 这条是这次瘦身的**验收条件**：54 个配置项太多了（用户要读 54 行才知道自己在
+    # 配什么、配错一个不影响启动只影响行为）。上限写死在这里，多一个就要有人解释。
+    check_true(
+        f"配置项不超过 20 个（现在 {len(keys)} 个）",
+        len(keys) <= 20,
+        str(sorted(keys)),
+    )
     check(
         "没有「配了但代码里没有」的键（pydantic 会静默忽略 → 用户以为配上了）",
-        unknown,
+        sorted(k for k in keys if k.lower() not in field_set),
         [],
     )
-    missing = sorted(f for f in fields if f.upper() not in keys and f not in CLI_ONLY_FIELDS)
+    missing = sorted(f for f in fields if f.upper() not in keys)
     check("每个字段都在 .env.example 里有说明", missing, [])
 
     # ------------------------------------------------------------------
@@ -120,73 +115,65 @@ def main() -> int:  # noqa: C901
     config_src = sources.get("config.py", "")
     unread: list[str] = []
     for name in fields:
-        if name in CLI_ONLY_FIELDS:
-            continue
         # 三种读法都要认：`settings.<name>`、`get_settings().<name>`、
         # 以及 config 自己那些派生属性里的 `self.<name>`（那也算真的被读了）
         pattern = rf"(?:settings|get_settings\(\)|self)\.{re.escape(name)}\b"
-        hits = 0
-        for text in sources.values():
-            if re.search(pattern, text):
-                hits += 1
-        if hits == 0:
+        if not any(re.search(pattern, text) for text in sources.values()):
             unread.append(name)
     check("没有「声明了但没人读」的字段（骗人的开关）", unread, [])
 
     # ------------------------------------------------------------------
-    print("\n--- 3. 已经删掉的旧配置不许再被引用 ---")
-    # **只认 `KEY=...` 那种生效的行**：注释里写"这个键已经作废、请删掉那一行"是好文档，
-    # 不是残留配置（一刀切按子串查会把这段说明判成 bug）。
+    print("\n--- 3. 砍掉的那些键不许再出现在代码/示例里 ---")
+    # 只剩十几个配置项，所以"哪些键被砍了"不再需要一份人工维护的名单 ——
+    # 只要它不在字段里、代码里也没有引用，就不该出现在 .env.example 里。
     example_keys = env_keys()
-    # config.py 里那份失效键名单是**故意**写出来的（启动时要靠它警告用户），所以
-    # "不许再被引用"只对其余文件成立。名单本身在这里被当作唯一事实来源来读。
-    other_sources = {
-        name: strip_comments(text) for name, text in sources.items() if name != "config.py"
-    }
-    other_text = "\n".join(other_sources.values()).lower()
-    for key in REMOVED_KEYS:
-        check_true(f"{key} 不在 .env.example 里（注释里提到不算）", key not in example_keys, key)
-        check_true(f"{key} 不是 Settings 字段", key.lower() not in field_set, key)
     check(
-        "除了 config.py 里的失效键名单，app/ 里没有别的地方还引用它们",
-        sorted({k for k in REMOVED_KEYS if k.lower() in other_text}),
+        ".env.example 里没有不是字段的键",
+        sorted(k for k in example_keys if k.lower() not in field_set),
         [],
     )
-    check_true(
-        "每个失效键都写了「现在该用什么」（否则警告等于没说）",
-        all(v.strip() for v in REMOVED_ENV_KEYS.values()),
-        str(REMOVED_ENV_KEYS),
-    )
+    # 砍掉的高级项仍然可以**在代码里**出现（写死成了常量），所以这里只查一件事：
+    # 它们不再是字段。挑几个最容易"偷偷回来"的。
+    for gone in (
+        "CLIENT_BATCH_SIZE",
+        "CLIENT_MAX_MESSAGES_PER_CYCLE",
+        "CLIENT_MISSING_ATTACHMENT",
+        "CLIENT_RECHECK_OVERLAP_HOURS",
+        "CLIENT_AMENDMENT_ENABLED",
+        "CLIENT_DRY_RUN",
+        "CLIENT_EXPORT_ADD_SEQ",
+        "CLIENT_DECRYPT_ENABLED",
+        "CLIENT_INITIAL_LOOKBACK_HOURS",
+        "LLM_TEMPERATURE",
+        "LLM_SECONDARY_MODEL",
+    ):
+        check_true(f"{gone} 已经不是配置项（写死成常量了）", gone.lower() not in field_set, gone)
     check_true("也没有残留的 cursor 配置字段", not any("cursor" in f for f in fields), str(fields))
 
     # ------------------------------------------------------------------
-    print("\n--- 3b. 用户 .env 里留着失效键要能看出来 ---")
-    # 这一步守的是 `extra="ignore"` 的另一面：淘汰的键不会让程序起不来，但也不会
-    # 生效 —— 于是"我明明配了"和"这个键根本没用"长得一模一样。启动时靠这个函数出声。
-    stale_file = SCRATCH / "stale.env"
+    print("\n--- 3b. 用户 .env 里留着非配置项的键要能看出来 ---")
+    # 这一步守的是 `extra="ignore"` 的另一面：这些键不会让程序起不来，但也不会生效
+    # —— 于是"我明明配了"和"这个键根本没用"长得一模一样（从旧版本升上来时最明显）。
+    env_file = SCRATCH / "unknown.env"
     SCRATCH.mkdir(parents=True, exist_ok=True)
-    stale_file.write_text(
+    env_file.write_text(
         "# 注释里的键不算\n"
         "\n"
         "CLIENT_DB_PATH=/data/nt_msg_export.db\n"
-        "CLIENT_INITIAL_LOOKBACK_HOURS=720\n"
-        "  client_cursor_key = abc  \n"
+        "CLIENT_BATCH_SIZE=200\n"
+        "  client_recheck_overlap_hours = 2  \n"
+        "POSTGRES_PASSWORD=hunter2\n"
+        "TZ=Asia/Shanghai\n"
         "不是键值行\n",
         encoding="utf-8",
     )
-    stale = stale_env_keys(stale_file)
     check(
-        "认出了失效的键（且只有它们）",
-        sorted(k for k, _ in stale),
-        ["CLIENT_CURSOR_KEY", "CLIENT_INITIAL_LOOKBACK_HOURS"],
+        "只报「我们自己前缀」的键（别的工具用的不报）",
+        sorted(unknown_env_keys(env_file)),
+        ["CLIENT_BATCH_SIZE", "CLIENT_RECHECK_OVERLAP_HOURS"],
     )
-    check_true(
-        "并且说清了现在该用什么",
-        all(instead.strip() for _, instead in stale),
-        str(stale),
-    )
-    check("文件不存在 → 空表（不是报错）", stale_env_keys(SCRATCH / "nope.env"), [])
-    check("env_file 被关掉（测试隔离）时不去读磁盘", stale_env_keys(), [])
+    check("文件不存在 → 空表（不是报错）", unknown_env_keys(SCRATCH / "nope.env"), [])
+    check("env_file 被关掉（测试隔离）时不去读磁盘", unknown_env_keys(), [])
 
     # ------------------------------------------------------------------
     print("\n--- 4. 字段名 = 环境变量名的小写（pydantic 的硬规则）---")
@@ -247,11 +234,22 @@ def main() -> int:  # noqa: C901
         _raises_config_error(lambda: Settings(client_sender_whitelist="oops").whitelist_fingerprint),
         True,
     )
-    check_true(
-        "quotes 键默认有一组（来自 nt_msg_db_util 的文档）",
-        len(Settings().quote_keys) >= 3,
-        str(Settings().quote_keys),
-    )
+
+    # ------------------------------------------------------------------
+    print("\n--- 7. 写死的常量本身是自洽的 ---")
+    # 它们取代了原来的 40 多个配置项，所以这里钉一遍：值还在、类型对、彼此不矛盾。
+    check_true("一轮预算是个正整数", isinstance(MAX_MESSAGES_PER_CYCLE, int) and MAX_MESSAGES_PER_CYCLE > 0,
+               str(MAX_MESSAGES_PER_CYCLE))
+    check_true("一次 SQL 取的量不超过一轮预算", BATCH_SIZE <= MAX_MESSAGES_PER_CYCLE,
+               f"{BATCH_SIZE} vs {MAX_MESSAGES_PER_CYCLE}")
+    check_true("上游的加密参数没被改坏（page_size/kdf_iter 是固定值）",
+               (NT_MSG_PAGE_SIZE, NT_MSG_KDF_ITER) == (4096, 4000),
+               f"{NT_MSG_PAGE_SIZE}/{NT_MSG_KDF_ITER}")
+    check_true("抽头长度是 1024（上游 1.decrypt.py 的常量）", NT_MSG_HEADER_SIZE == 1024,
+               str(NT_MSG_HEADER_SIZE))
+    check_true("导出是全量（没有增量开关）", EXPORT_OVERLAP_SECONDS > 0, str(EXPORT_OVERLAP_SECONDS))
+    check_true("默认不把图片喂给模型、也不做交叉验证（要开就去改常量）",
+               VLM_ENABLED is False and CROSS_CHECK_ENABLED is False, "VLM/CROSS_CHECK")
 
     print()
     if fails:

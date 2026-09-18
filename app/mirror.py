@@ -7,18 +7,17 @@
 
 1. 水位线只能表达"我处理到哪儿了"，表达不了"这一条处理好了没有"。
    中途失败要么丢消息（水位推过去了），要么整段重放；
-2. 它是**一条**纪录，所以"这条的内容变了"这种事根本没法表达 ——
-   而通知被编辑/补充恰恰是常态。
+2. 它是**一条**纪录，粒度太粗：同一秒里后到的消息会被它跳过。
 
-镜像库把状态降到**每一条消息**上，于是这三件事一起解决了：
+镜像库把状态降到**每一条消息**上：
 
     读源库 → 这条在镜像里吗？→ 不在：处理它
-                            → 在、内容没变、状态 done：跳过（零成本）
-                            → 在、**内容变了**：重新处理 → 后端按
-                              (user_id, raw_message_id) 幂等，**更新原来那条任务**
+                            → 在、状态 done/skipped：跳过（零成本）
                             → 在、状态 pending/failed：重试（这就是恢复队列）
 
-于是"增量更新"就是一次镜像查询，而不是靠水位线猜。
+判据是「**读没读过**」，不是时间窗口 —— 时间窗口表达不了"这一条到底处理过没有"，
+比窗口更老、而镜像里又没有的消息会永远读不到（换过导出库、镜像被删过、白名单刚
+放开），而那正是这套系统最怕的静默漏消息。
 
 ## 状态是四态而不是一个布尔
 
@@ -31,16 +30,15 @@
 
     pending  读到了、还没处理完（崩溃/重启后就是靠它恢复的）
     done     处理完成（= 你说的"已读"）
-    skipped  判定为不需要（订阅之外、闲聊、源库缺字段）—— 也是终态，不再重试
+    skipped  判定为不需要（白名单外、闲聊、源库缺字段）—— 也是终态，不再重试
     failed   处理失败，下轮重试
 
-另外存了 `content_hash` 和 `raw_id`：前者是"内容变了"的判据，后者让"补充"
-能落到原来那条任务上。除这两样，其余都只是为了让人能看出来**为什么**。
+另外存了 `raw_id`：它让"这条消息对应后端哪条原文"能被查回来（重试、去重都要它）。
+其余字段都只是为了让人能看出来**为什么**。
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import sqlite3
 from contextlib import closing
@@ -66,9 +64,8 @@ CREATE TABLE IF NOT EXISTS message (
   group_id      TEXT NOT NULL DEFAULT '',
   sender_id     TEXT NOT NULL DEFAULT '',
   source_ts     INTEGER NOT NULL DEFAULT 0,   -- 源库的秒级时间戳
-  content_hash  TEXT NOT NULL DEFAULT '',     -- 用于识别"这条的内容变了"
   state         TEXT NOT NULL DEFAULT 'pending',
-  raw_id        TEXT,                         -- 后端的原文 id（补充要落回它）
+  raw_id        TEXT,                         -- 后端的原文 id（重试/去重要用它）
   attempts      INTEGER NOT NULL DEFAULT 0,
   last_error    TEXT,
   first_seen_at INTEGER NOT NULL DEFAULT 0,
@@ -76,15 +73,7 @@ CREATE TABLE IF NOT EXISTS message (
 );
 CREATE INDEX IF NOT EXISTS ix_message_state_ts ON message(state, source_ts);
 CREATE INDEX IF NOT EXISTS ix_message_ts       ON message(source_ts);
-
--- 「谁补充了谁」。source_msg_id 是**做补充的那条新消息**，
--- target_msg_id 是被它补充的那条**已经处理过**的消息。
--- 有了它，同一条补充消息不会被反复当成新的补充来处理。
-CREATE TABLE IF NOT EXISTS amendment (
-  source_msg_id TEXT PRIMARY KEY,
-  target_msg_id TEXT NOT NULL,
-  created_at    INTEGER NOT NULL DEFAULT 0
-);
+CREATE INDEX IF NOT EXISTS ix_message_group    ON message(group_id, source_ts);
 
 -- 小配置快照。目前只存一件事：**白名单的指纹**。
 --
@@ -98,35 +87,12 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
-def content_hash(message) -> str:
-    """一条源消息的指纹。
-
-    只用**会影响抽取结果**的东西：正文 + 附件清单。刻意不含 `source_ts`
-    （时间戳是标识，不是内容）也不含 parse_status（那是解析质量，不是内容）——
-    把标识混进指纹会让"内容没变"永远判成"变了"，于是每轮都重新抽一次，
-    白花模型的钱。
-    """
-    parts = [
-        str(getattr(message, "group_id", "") or ""),
-        str(getattr(message, "sender_id", "") or ""),
-        str(getattr(message, "text", "") or ""),
-    ]
-    for item in sorted(
-        (getattr(message, "attachments", None) or []),
-        key=lambda a: str(a.get("name") or a.get("url") or a.get("md5") or ""),
-    ):
-        parts.append("|".join(str(item.get(k) or "") for k in ("type", "name", "url", "md5", "size")))
-    raw = "\x1f".join(parts)
-    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:32]
-
-
 @dataclass
 class MirrorRow:
     msg_id: str
     group_id: str
     sender_id: str
     source_ts: int
-    content_hash: str
     state: str
     raw_id: str | None
     attempts: int
@@ -186,71 +152,38 @@ class Mirror:
 
     # ---------------- 读写状态 ----------------
 
-    def claim(self, message_row) -> tuple[MirrorRow, str]:
-        """把这条消息登记进镜像（如果还没有），返回 `(行, 发生了什么)`。
+    def claim(self, message_row) -> MirrorRow:
+        """把这条消息登记进镜像，返回登记后的那一行。
 
-        `发生了什么` 是给调用方决定要不要重新抽取的：
-
-            new       第一次见 → 处理
-            changed   **内容变了** → 重新处理（后端幂等会把原来那条任务更新掉）
-            retry     上次没处理完/失败了 → 重试
-            unchanged 处理过了、内容也没变 → 跳过
+        **已经有了就原样返回**（不覆盖状态）：调用方只会在"这条我还没读过"时喊它，
+        所以这里就是一条 `INSERT OR IGNORE`。已经存在的行由 `unfinished()`（重试）
+        和 `reopen_whitelist_skips()`（白名单变了）负责改状态，不从这里走。
 
         ⚠️ 登记成 `pending` 而不是 `done`：**先记账再干活**。反过来（干完才记账）
         的话，进程在"已经写进后端、还没记账"之间崩掉就只是重做一次（幂等挡住），
         而"记完账才发现没写成"会**丢掉一条消息**。宁可重做，不可漏。
         """
         stamp = now_ms()
-        digest = content_hash(message_row)
         with closing(self._connect()) as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO message (msg_id, group_id, sender_id, source_ts,"
+                " state, attempts, first_seen_at, updated_at)"
+                " VALUES (?,?,?,?,?,0,?,?)",
+                (
+                    str(message_row.msg_id),
+                    str(message_row.group_id or ""),
+                    str(message_row.sender_id or ""),
+                    int(message_row.timestamp or 0),
+                    STATE_PENDING,
+                    stamp,
+                    stamp,
+                ),
+            )
+            conn.commit()
             row = conn.execute(
                 "SELECT * FROM message WHERE msg_id=?", (str(message_row.msg_id),)
             ).fetchone()
-            if row is None:
-                conn.execute(
-                    "INSERT INTO message (msg_id, group_id, sender_id, source_ts,"
-                    " content_hash, state, attempts, first_seen_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,0,?,?)",
-                    (
-                        str(message_row.msg_id),
-                        str(message_row.group_id or ""),
-                        str(message_row.sender_id or ""),
-                        int(message_row.timestamp or 0),
-                        digest,
-                        STATE_PENDING,
-                        stamp,
-                        stamp,
-                    ),
-                )
-                conn.commit()
-                what = "new"
-            else:
-                if str(row["content_hash"]) != digest:
-                    # 内容变了：重新处理。后端按 (user_id, raw_message_id) 幂等，
-                    # 所以这一条会把**原来那条任务**更新掉，而不是新建一条。
-                    conn.execute(
-                        "UPDATE message SET content_hash=?, state=?, group_id=?, sender_id=?,"
-                        " source_ts=?, updated_at=? WHERE msg_id=?",
-                        (
-                            digest,
-                            STATE_PENDING,
-                            str(message_row.group_id or ""),
-                            str(message_row.sender_id or ""),
-                            int(message_row.timestamp or 0),
-                            stamp,
-                            str(message_row.msg_id),
-                        ),
-                    )
-                    conn.commit()
-                    what = "changed"
-                elif str(row["state"]) in TERMINAL_STATES:
-                    what = "unchanged"
-                else:
-                    what = "retry"
-            fresh = conn.execute(
-                "SELECT * FROM message WHERE msg_id=?", (str(message_row.msg_id),)
-            ).fetchone()
-        return _row(fresh), what
+        return _row(row)
 
     def finish(self, msg_id: str, *, state: str, raw_id: str | None = None,
                error: str | None = None) -> None:
@@ -327,33 +260,10 @@ class Mirror:
                 "SELECT state, COUNT(*) AS n FROM message GROUP BY state"
             ).fetchall()
             total = conn.execute("SELECT COUNT(*) AS n FROM message").fetchone()
-            amendments = conn.execute("SELECT COUNT(*) AS n FROM amendment").fetchone()
         return {
             "total": int(total["n"] if total else 0),
             "by_state": {str(r["state"]): int(r["n"]) for r in rows},
-            "amendments": int(amendments["n"] if amendments else 0),
         }
-
-    # ---------------- 补充关系 ----------------
-
-    def mark_amendment(self, source_msg_id: str, target_msg_id: str) -> None:
-        """记下「source 补充了 target」。已经记过就什么都不做。"""
-        with closing(self._connect()) as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO amendment (source_msg_id, target_msg_id, created_at)"
-                " VALUES (?,?,?)",
-                (str(source_msg_id), str(target_msg_id), now_ms()),
-            )
-            conn.commit()
-
-    def amendment_of(self, source_msg_id: str) -> str | None:
-        """这条消息是补充吗？是的话返回它补充的那条。"""
-        with closing(self._connect()) as conn:
-            row = conn.execute(
-                "SELECT target_msg_id FROM amendment WHERE source_msg_id=?",
-                (str(source_msg_id),),
-            ).fetchone()
-        return str(row["target_msg_id"]) if row else None
 
     def raw_id_of(self, msg_id: str) -> str | None:
         row = self.get(msg_id)
