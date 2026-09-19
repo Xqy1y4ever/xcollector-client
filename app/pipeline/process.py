@@ -51,7 +51,7 @@ from .extract import (
     run_llm,
     cross_check,
 )
-from .rule_extract import is_noise, rule_extract
+from .rule_extract import is_group_chore, is_noise, rule_extract
 
 logger = logging.getLogger(__name__)
 
@@ -155,8 +155,27 @@ async def extract(message: SourceMessage, settings: Settings) -> tuple[dict | No
 
     与 bot 的 `parse_content` 同一套语义：LLM 那条路整体失败就降级到规则，
     并把这件事记下来（降级 = 盲区，用户必须能看到）。
+
+    ## 确定性的门**先过**，而且对模型也生效
+
+    闲聊/回执（`is_noise`）和群务（`is_group_chore`：改群名片、进群、查收名单…）
+    在这里就地判死，**不看模型怎么说**，也不花那一次模型调用。
+
+    真实教训（2026-09-19 线上）：v4 的提示词已经写了"群务不算通知"，模型还是把
+    「各位同学：请完成群昵称修改…」判成了「按时报到并查看近期通知合集」——
+    而那条 `GROUP_CHORE` 一票否决只长在 `rule_extract` 里，`llm` 模式下模型说了算，
+    于是它从旁边绕过去了。这一层是**代码说了算**的部分，不该由模型的发挥决定。
     """
     text = message_text(message)
+    chore = is_group_chore(text)
+    if chore or is_noise(text):
+        logger.info(
+            "确定性判据直接不建条：%s msg_id=%s",
+            f"群务（{chore}）" if chore else "闲聊/回执",
+            message.msg_id,
+        )
+        return None, False, 0
+
     rule_result = rule_extract(text, message.ts_ms, at_all=False)
 
     if settings.client_extractor == "rule":

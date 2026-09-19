@@ -44,6 +44,10 @@ jobs:
       - name: 抽取（判据门槛 / 相对时间日历 / LLM 那条路）
         run: python -m tests.check_extract
 
+      # 重判历史通知那个工具（默认干跑）：确定性判据先过、干跑不写、--apply 才归档。
+      - name: 重判工具（清理历史误报）
+        run: python -m tests.check_rejudge
+
       - name: 地点提取（与 bot 共用同一套用例）
         run: python -m tests.check_location
 
