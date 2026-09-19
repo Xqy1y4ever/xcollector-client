@@ -256,6 +256,25 @@ class BackendClient:
         body = resp.json()
         return body if isinstance(body, dict) else {}
 
+    async def add_correction(
+        self, notif_id: str, *, field: str, value: Any, actor: str = "client"
+    ) -> dict:
+        """POST /api/notifications/{id}/corrections —— 人工修正（只追加）。
+
+        `field` 只允许 `title/summary/location/due_at/due_text/status`（后端会校验）。
+        客户端只用它做一件事：**重抽之后判定"不再是通知"的，把原来那条归档**
+        （`field="status", value="archived"`）—— 用户令牌删不了通知（那是服务令牌
+        专属），但归档做得到，而且不丢数据。
+        """
+        resp = await self._write(
+            "POST",
+            f"/api/notifications/{notif_id}/corrections",
+            json={"field": field, "value": value, "actor": actor},
+            purpose="notifications.corrections",
+        )
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+
     async def add_stats(self, day: str, fields: dict[str, int]) -> dict:
         cleaned = {k: int(v) for k, v in fields.items() if v}
         if not cleaned:

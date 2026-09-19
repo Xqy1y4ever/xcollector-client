@@ -97,6 +97,8 @@ class CycleReport:
     recovered: int = 0
     # 其中有多少条是"用户标了未读、这轮真的重抽了一遍"的（见 mirror.mark_unread）
     reprocessed: int = 0
+    # 重抽之后按新判据"不再是通知"、于是把原来那条通知**归档**掉的条数
+    withdrawn: int = 0
     outcomes: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     # 这一轮的"解密 + 导出"做了什么（没配 CLIENT_NT_MSG_DB 时是 None）
@@ -136,19 +138,29 @@ async def verify_identity(backend: BackendClient, settings: Settings) -> dict:
     return who
 
 
-async def load_processed_raw_ids(backend: BackendClient) -> set[str]:
-    """我已经有通知的那些 raw id —— **只在镜像不认识某条消息时**用来兜底。
+async def load_processed_raw_ids(backend: BackendClient) -> dict[str, str]:
+    """我已经有通知的那些：`{raw_message_id: notification_id}`。
 
-    为什么还留着这一层：镜像被删了/换了机器，如果没有它，那批历史会被整段重新
-    抽取（真金白银的模型调用）。有它，那些消息会被直接认成"处理过了"，
-    一次模型调用都不花。
+    两个用途：
+
+    * **镜像不认识某条消息时**当兜底集合用：镜像被删了/换了机器，如果没有它，
+      那批历史会被整段重新抽取（真金白银的模型调用）；
+    * 用户"标为未读"重抽之后，如果按新判据**不再是通知**，要拿 `notification_id`
+      去把原来那条归档（`process._withdraw_notification`）—— 只把 raw 标成 noise
+      是不够的，板子上那条误报还在。
     """
     try:
         rows = await backend.list_notifications(limit=2000)
     except BackendError as exc:
         logger.warning("拉取已有通知失败（这次不去重，靠后端幂等兜底）：%s", exc)
-        return set()
-    return {str(r.get("raw_message_id") or "") for r in rows if r.get("raw_message_id")}
+        return {}
+    out: dict[str, str] = {}
+    for row in rows:
+        raw_id = str(row.get("raw_message_id") or "")
+        notif_id = str(row.get("id") or "")
+        if raw_id and notif_id:
+            out[raw_id] = notif_id
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +225,7 @@ async def _handle_one(
     resolver: AttachmentResolver,
     mirror: Mirror,
     known_raw_ids: set[str],
+    notification_ids: dict[str, str],
     report: CycleReport,
     *,
     force: bool = False,
@@ -221,7 +234,9 @@ async def _handle_one(
 
     `force=True` 表示这条是**用户标成未读、要求重抽**的（镜像状态 `reprocess`）：
     下面会把它透传给 `process_message`，让那条"后端已经有通知就跳过抽取"的捷径
-    失效 —— 不然"重新处理"就只是把状态改回 done，一次模型都没调。
+    失效 —— 不然"重新处理"就只是把状态改回 done，一次模型都没调；而且如果重抽的
+    结论是"不再是通知"，`notification_ids` 里的那个 id 会被用来**把原来那条归档**
+    （否则板子上的误报一条都不会少，用户会觉得"改了没用"）。
 
     ## 白名单在这里只是**兜底**
 
@@ -253,7 +268,13 @@ async def _handle_one(
         return Outcome(result=OUTCOME_SKIPPED, reason=reason)
 
     outcome = await process_message(
-        message, backend, settings, resolver, known_raw_ids=known_raw_ids, force=force
+        message,
+        backend,
+        settings,
+        resolver,
+        known_raw_ids=known_raw_ids,
+        notification_ids=notification_ids,
+        force=force,
     )
     # 后端已经有这条通知（镜像被删过/换机器时会走到这里）→ 补记成 done，
     # 于是下一轮连这次查询都省了
@@ -311,7 +332,8 @@ async def run_cycle(
     else:
         database = db or SourceDatabase(settings.resolved_db_path)
 
-    known_raw_ids = await load_processed_raw_ids(backend)
+    notified = await load_processed_raw_ids(backend)
+    known_raw_ids = set(notified)
     report.mirror_before = store.stats()
 
     # ---- 0) 白名单校验 + 清掉旧版本留下的垃圾 ----
@@ -344,7 +366,7 @@ async def run_cycle(
         try:
             outcome = await _handle_one(
                 message, backend, settings, attachment_resolver, store,
-                known_raw_ids, report, force=force,
+                known_raw_ids, notified, report, force=force,
             )
         except Exception as exc:  # 单条炸了不能拖垮整批
             logger.exception("处理消息失败 msg_id=%s", message.msg_id)
@@ -354,6 +376,8 @@ async def run_cycle(
             return
 
         report.processed += 1
+        if outcome.withdrawn:
+            report.withdrawn += 1
         _accumulate(report, outcome)
         stats = _merge(stats, outcome_stats(
             outcome=outcome.result,
@@ -501,6 +525,12 @@ def log_report(report: CycleReport) -> None:
         )
     if report.prepared:
         logger.info("源库准备：%s", report.prepared)
+    if report.withdrawn:
+        logger.info(
+            "重抽之后有 %d 条按新判据不再是通知，已把原来的任务归档"
+            "（原文和修正历史都还在，前端切到「已归档」能看到）",
+            report.withdrawn,
+        )
     if report.mirror_after:
         logger.info(
             "镜像：共 %d 条（%s）",

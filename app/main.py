@@ -209,7 +209,10 @@ async def show_status(backend: BackendClient, settings, db: SourceDatabase) -> i
     print("  订阅            不适用（订阅只影响 bot 的实时入库）")
 
     processed = await load_processed_raw_ids(backend)
-    print(f"  后端已有通知的 raw id：{len(processed)} 个（只在镜像不认识某条消息时兜底）")
+    print(
+        f"  后端已有通知的 raw id：{len(processed)} 个"
+        "（镜像不认识某条消息时兜底；「标为未读」重抽时也用它把不再是通知的那条归档）"
+    )
     print(f"\n  用户：{user.get('qq')}（{user.get('id')}）")
     return 0
 

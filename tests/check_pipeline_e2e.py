@@ -544,6 +544,26 @@ async def run_all() -> int:  # noqa: C901
             check_true("它走的是便宜的捷径（「已经建过通知」）",
                        report.unchanged >= 1, f"unchanged={report.unchanged} outcomes={report.outcomes}")
             check("于是也回到 done（不再每轮重试）", mirror_re.get("700").state, STATE_DONE)
+
+            # ---- 重抽之后"不再是通知" → 原来那条**被归档**（清理历史误报的通道）----
+            # 判据收紧之后，"重新处理"如果只把 raw 标成 noise，板子上那条误报还在 ——
+            # 用户会觉得"改了没用"。所以重抽时要把已经不成立的条归档掉。
+            chore_text = "欢迎大家入群，请大家按照要求修改群名片，格式是【年级 院系 姓名】"
+            make_source_db(db_re, [
+                {"msg_id": "700", "ts": BASE_TS + 7000, "text": chore_text, "content": text_of(chore_text)},
+            ])
+            marked = mirror_re.mark_unread()
+            check("标为未读：标上了 1 条", marked["marked"], 1)
+            report = await run_cycle(
+                backend_re, settings_re, db=SourceDatabase(db_re), mirror=mirror_re
+            )
+            check("重抽判定为非通知（群务）", report.outcomes.get("noise"), 1)
+            check("报告里说了归档了几条", report.withdrawn, 1)
+            after_withdraw = [n for n in notifications(token) if n.get("raw_message_id") == raw_id]
+            check("还是那一条（没有多出来）", len(after_withdraw), 1)
+            check("而且它被归档了（不再是 active）", after_withdraw[0].get("status"), "archived")
+            check_true("原文还在（归档不删数据）",
+                       bool(sync(token, f"/api/notifications/{after_withdraw[0]['id']}").json().get("raw")))
         finally:
             await backend_re.close()
 

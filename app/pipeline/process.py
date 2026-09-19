@@ -77,6 +77,8 @@ class Outcome:
     tokens: int = 0
     reason: str | None = None
     attachments: list[dict] = field(default_factory=list)
+    # 重抽之后按新判据"不再是通知"→ 把原来那条通知归档了吗（见 _withdraw_notification）
+    withdrawn: bool = False
 
 
 def message_text(message: SourceMessage) -> str:
@@ -250,12 +252,16 @@ async def process_message(
     resolver: AttachmentResolver,
     *,
     known_raw_ids: set[str] | None = None,
+    notification_ids: dict[str, str] | None = None,
     force: bool = False,
 ) -> Outcome:
     """处理一条群消息。返回 Outcome（调用方据此记统计与日志）。
 
     `known_raw_ids`：我已经有通知的 raw id 集合。命中就**跳过抽取** ——
     镜像被删掉之后重扫时，这一个参数决定了要不要把模型的钱再花一遍。
+
+    `notification_ids`：`{raw_id: notification_id}`。**只在重抽（`force`）时用**：
+    按新判据判定"不再是通知"的消息，要把原来那条通知归档掉，得知道它的 id。
 
     `force`：**用户点名要求重抽**的那条（镜像里状态是 `reprocess`，见
     `mirror.mark_unread`）。此时那条"已经有通知就跳过"的捷径**不算数** ——
@@ -264,7 +270,8 @@ async def process_message(
 
     重抽之后 `POST /api/notifications` 是**幂等 upsert**（后端按
     `(user_id, raw_message_id)` 唯一，只覆盖机器字段、不动人工修正），
-    所以结果就地更新到那条通知上，不会多出一条。
+    所以结果就地更新到那条通知上，不会多出一条；而**重抽之后不再是通知**的那些，
+    由 `_withdraw_notification()` 归档（否则板子上的误报一条都不会少）。
     """
     text = message_text(message)
     if not message.group_id or not message.sender_id:
@@ -330,9 +337,21 @@ async def process_message(
                 reason="LLM 失败且规则也无法解析",
                 attachments=attachments,
             )
+        # **重抽时按新判据不再是通知 → 把原来那条通知归档。**
+        #
+        # 为什么必须有这一步：判据收紧之后，"重新处理"如果只是把 raw 标成 noise，
+        # 原来那条误报还留在任务板上 —— 用户点了"重新处理"，板子上一条都不会少，
+        # 看起来就是"改了没用"。归档（corrections: status=archived）是用户令牌
+        # 做得到的事（删通知只有服务令牌能做），而且不丢数据：原文和修正历史都在。
+        archived = await _withdraw_notification(backend, message, raw_id, force, notification_ids)
         await _patch_state(backend, raw_id, OUTCOME_NOISE, "判定为非通知")
         return Outcome(
-            result=OUTCOME_NOISE, raw_id=raw_id, tokens=tokens, attachments=attachments
+            result=OUTCOME_NOISE,
+            raw_id=raw_id,
+            tokens=tokens,
+            attachments=attachments,
+            withdrawn=archived,
+            reason="判定为非通知，已把原来的任务归档" if archived else None,
         )
 
     payload = build_notification_payload(raw_id, message, result)
@@ -367,6 +386,38 @@ async def process_message(
         tokens=tokens,
         attachments=attachments,
     )
+
+
+async def _withdraw_notification(
+    backend: BackendClient,
+    message: SourceMessage,
+    raw_id: str,
+    force: bool,
+    notification_ids: dict[str, str] | None,
+) -> bool:
+    """重抽之后"不再是通知"→ 把原来那条通知归档。返回是否真的归档了。
+
+    只对**用户点名重抽**（`force`）的做这件事：正常流程里这条消息本来就没建过条，
+    没有东西要撤。归档走 corrections（`status=archived`）—— 用户令牌做得到、
+    也不删数据（原文与修正历史都留着，前端切到「已归档」还能看到）。
+
+    做不成也不吞：写一行 WARNING 并返回 False，调用方据此在 Outcome.reason 里
+    说明"判定为非通知"，这样"板子上那条为什么还在"是查得到的。
+    """
+    if not force or not notification_ids:
+        return False
+    notif_id = notification_ids.get(raw_id)
+    if not notif_id:
+        return False
+    try:
+        await backend.add_correction(notif_id, field="status", value="archived", actor="client")
+    except BackendError as exc:
+        logger.warning(
+            "重抽判定为非通知，但归档失败 notif=%s msg_id=%s：%s", notif_id, message.msg_id, exc
+        )
+        return False
+    logger.info("重抽判定为非通知，已把原来的任务归档：notif=%s msg_id=%s", notif_id, message.msg_id)
+    return True
 
 
 async def _patch_state(
