@@ -1,7 +1,7 @@
 name: Self-checks
 
-# 只跑**离线**自检：源库读取、相对时间解析、地点提取。
-# 这三个都不联网、不需要后端，所以可以在 CI 里稳定地跑。
+# 只跑**离线**自检：源库读取、相对时间解析、地点提取、抽取、镜像状态机、Web UI、
+# 解密导出。都不联网、不需要后端，所以可以在 CI 里稳定地跑。
 #
 # 端到端那个（tests/check_pipeline_e2e.py）需要先起一个后端，所以没放这里 ——
 # 部署/发版前请在本机按 README 的「自检」一节跑一遍。
@@ -26,10 +26,23 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
+      # 放在最前面：它扫的是"执行到才会炸"的那类错误（改名漏改调用处、
+      # except 写了个没导入的异常类），其他测试通常跑不到那些分支。
+      # 现实中已经出现过两次，都是用户在日志里发现的。
+      - name: 静态：用了但没定义的名字
+        run: python -m tests.check_static
+
       # 这两个文件和 xcollector-bot 里的同名文件是**逐字复制**的关系。
       # 在 CI 里跑它们，就是为了在两边漂移时立刻红。
       - name: 相对时间解析（与 bot 共用同一套用例）
         run: python -m tests.check_timeparse
+
+      # 抽取层：提示词里的日历、判定门槛、以及"模型没算出时间就用规则补"。
+      # 最后一节会**真的走一遍「拼提示词 → 调模型 → 合并规则」**（只把网络层换成假的）：
+      # 曾经这里漏改过一个函数名，导致每次模型调用都 NameError、被上层吞成
+      # "降级为规则抽取"，而当时所有自检都是绿的。这条必须留在 CI 里。
+      - name: 抽取（判据门槛 / 相对时间日历 / LLM 那条路）
+        run: python -m tests.check_extract
 
       - name: 地点提取（与 bot 共用同一套用例）
         run: python -m tests.check_location
