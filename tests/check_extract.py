@@ -18,10 +18,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import sys
 from datetime import datetime
 
-from app.config import get_settings
+from app.config import Settings, get_settings
+from app.pipeline import extract as ex_mod
 from app.pipeline.extract import (
     LLMNotification,
     PROMPT_VER,
@@ -57,6 +60,28 @@ def check(name: str, got, want) -> None:
 
 def check_true(name: str, cond: bool, detail: str = "") -> None:
     check(name + (f"  {detail}" if detail else ""), bool(cond), True)
+
+
+def run_llm_path(text: str, ts_ms: int):
+    """把这条消息**真的**走一遍抽取链路（`process.extract`），网络层由调用方换掉。
+
+    ⚠️ 两个仓库唯一不同的地方就是这一小段：bot 那边走的是 `runner.parse_content`。
+    其余断言两边逐字一致。
+    """
+    from app.pipeline.process import extract as extract_message
+    from app.source.ntmsg import SourceMessage
+
+    message = SourceMessage(
+        msg_id="m1", timestamp=ts_ms // 1000, group_id="g1", sender_id="s1",
+        sender_name="老师", text=text,
+    )
+    settings = Settings(
+        client_extractor="both",
+        llm_model="fake-model",
+        llm_api_base="http://127.0.0.1:1/v1",
+        llm_api_key="fake-key",
+    )
+    return asyncio.run(extract_message(message, settings))
 
 
 def main() -> int:  # noqa: C901
@@ -212,6 +237,69 @@ def main() -> int:  # noqa: C901
     check("比消息还早一个月的时间被丢掉（不许当真）", bad["due_at"], None)
     check("把握归零", bad["due_confidence"], 0.0)
     check("due_text 留着给人看", bad["due_text"], "8月1日")
+
+    # ------------------------------------------------------------------
+    print("\n--- 7. 真的走一遍「拼提示词 → 调模型 → 合并规则」这条路（网络层换成假的）---")
+    # 为什么必须有这一节：上面全是纯函数，而真正会坏的是**拼提示词 + 调模型**这一段。
+    # 现实教训：`build_system_prompt` 改名成 `render_system_prompt` 之后，`_call_model`
+    # 里的调用处没跟着改 —— 每次模型调用都变成 `NameError`，被上层吞成
+    # "降级为规则抽取"，而**所有自检都是绿的**（没有任何测试真的调用过这条路）。
+    llm_calls: list[dict] = []
+    reply = {
+        "is_notification": True,
+        "reason": "",
+        "title": "提交军训心得",
+        "summary": "下周三前把军训心得交给班长。",
+        "location": None,
+        "due_at": None,           # ← 故意不给时间：看规则兜底接不接得住
+        "due_text": "下周三前",
+        "due_confidence": 0.0,
+        "evidence": "大家下周三前把军训心得交到班长那里",
+    }
+
+    class _FakeCompletion:
+        total_tokens = 7
+
+        def __init__(self, payload: dict):
+            # 必须**每次调用时**再序列化：写成类属性的话，第一次求值之后就被冻住了，
+            # 后面改 `reply` 不会生效（第一版就踩了这个坑：第二个用例拿到的还是第一个的回答）。
+            self.text = json.dumps(payload, ensure_ascii=False)
+
+    async def _fake_acompletion(**kwargs):
+        llm_calls.append(kwargs)
+        return _FakeCompletion(reply)
+
+    original = ex_mod.acompletion
+    try:
+        ex_mod.acompletion = _fake_acompletion
+        result, degraded, tokens = run_llm_path("大家下周三前把军训心得交到班长那里", ANCHOR)
+    finally:
+        ex_mod.acompletion = original
+
+    check("这条路跑通了（没有降级）", degraded, False)
+    check("调了 1 次模型", len(llm_calls), 1)
+    check_true("拿回的是模型的结果", result is not None and result["title"] == "提交军训心得", str(result))
+    check("token 数带回来了", tokens, 7)
+    system = llm_calls[0]["messages"][0]["content"]
+    check_true("提示词里带着按发送时间算好的日历",
+               "本周：周一 09-14" in system and "下周：周一 09-21" in system)
+    check_true("提示词里带着消息发送时间", "2026-09-16 15:00" in system)
+    check_true("提示词里没有没替换的占位符",
+               all(p not in system for p in ("{send_time}", "{weekday}", "{tz}", "{calendar}")))
+    check("模型没给 due_at → 规则把它补上了", result["due_at"], want_due)
+    check("并如实标出这条被规则补过", result["extractor"], "llm+rule")
+    check("due_text 用规则解析出的时间短语", result["due_text"], "下周三前")
+    check_true("把握不超过 0.8", 0 < float(result["due_confidence"]) <= 0.8, str(result["due_confidence"]))
+
+    # 模型判"不是通知"、规则也没有明确时间 → 不建条（别让闲聊变成任务）
+    reply.update({"is_notification": False, "reason": "回执", "title": "", "due_text": None})
+    try:
+        ex_mod.acompletion = _fake_acompletion
+        result2, degraded2, _tokens2 = run_llm_path("收到", ANCHOR)
+    finally:
+        ex_mod.acompletion = original
+    check("模型判非通知 + 规则也没有时间 → 不建条", result2, None)
+    check("而且不算降级（模型正常回答了）", degraded2, False)
 
     print()
     if fails:

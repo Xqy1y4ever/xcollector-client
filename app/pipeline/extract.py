@@ -215,7 +215,7 @@ async def _call_model(
     json_mode: bool,
 ) -> tuple[LLMNotification, int]:
     messages = [
-        {"role": "system", "content": build_system_prompt(int(raw["ts"]), tz)},
+        {"role": "system", "content": render_system_prompt(int(raw["ts"]), tz)},
         {"role": "user", "content": build_user_content(raw, images)},
     ]
     completion = await acompletion(
