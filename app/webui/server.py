@@ -288,23 +288,37 @@ async def _collect_state() -> dict:
     except Exception as exc:  # noqa: BLE001 - 状态页不该因为镜像坏了就打不开
         state["mirror"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
+    # **正在跑一轮的时候不去读源库。** 那两个计数要开连接读导出库，而导出那一轮
+    # 收尾要把它的日志模式切回 DELETE（需要独占）—— 页面每 1.5 秒轮询一次，
+    # 正好撞上就报 "database is locked"，整轮白跑（2026-09-19 用户日志里那次）。
+    # 页面本来也不需要跑的中间那几秒的数字。空着必须在页面上说明原因（见下）。
+    busy = RUNNER.snapshot()["busy"]
+
     if state["source"].get("ok"):
         groups = tuple(settings.group_whitelist_map)
         senders = tuple(settings.sender_whitelist_map)
         state["config"]["groups"] = sorted(groups)
         state["config"]["senders"] = sorted(senders)
-        try:
-            # 白名单**下推到 SQL**：这两个数都只算白名单内的消息。
-            # 页面上要能同时看到"白名单内共 N 条"和"没读过的 M 条" ——
-            # 配了白名单的人不该看到"还有 77 万条没读过"。
-            state["matching"] = db.count_matching(groups=groups, senders=senders)
-            state["unread"] = db.count_unread(
-                settings.resolved_mirror_path, groups=groups, senders=senders
-            )
-            state["scope"] = "whitelist" if (groups or senders) else "all"
-        except SourceDatabaseError as exc:
+        if busy:
             state["unread"] = None
-            state["source"]["unread_error"] = str(exc)
+            state["matching"] = None
+            state["scope"] = "whitelist" if (groups or senders) else "all"
+        else:
+            try:
+                # 白名单**下推到 SQL**：这两个数都只算白名单内的消息。
+                # 页面上要能同时看到"白名单内共 N 条"和"没读过的 M 条" ——
+                # 配了白名单的人不该看到"还有 77 万条没读过"。
+                state["matching"] = db.count_matching(groups=groups, senders=senders)
+                state["unread"] = db.count_unread(
+                    settings.resolved_mirror_path, groups=groups, senders=senders
+                )
+                state["scope"] = "whitelist" if (groups or senders) else "all"
+            except SourceDatabaseError as exc:
+                state["unread"] = None
+                state["source"]["unread_error"] = str(exc)
+
+    if busy:
+        state["counts_skipped"] = "正在跑一轮：这几个数先不统计（免得和导出抢同一个库），跑完自动出来"
 
     backend = BackendClient(settings)
     try:

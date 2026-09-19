@@ -332,7 +332,17 @@ class SourceDatabase:
             uri = f"file:{self.path.as_posix()}?mode=ro"
             conn = sqlite3.connect(uri, uri=True, timeout=5.0)
         except sqlite3.Error as exc:
-            raise SourceDatabaseError(f"打不开源库 {self.path}：{exc}") from exc
+            # 兜底：导出库停在 WAL 模式、而 `-shm` 文件不在了的时候，**只读**打不开
+            # （SQLite 需要建 -shm，只读连接做不到）。这时退化成普通打开 ——
+            # 我们只读使用它（一条 SELECT，没有任何写），退化成可写打开并不会去改数据，
+            # 只是允许 SQLite 自己把 -wal/-shm 补上。不让一个附属文件把整轮卡死。
+            logger.warning(
+                "只读打开源库失败（%s），退化成普通打开（仍然只读使用）：%s", self.path.name, exc
+            )
+            try:
+                conn = sqlite3.connect(str(self.path), timeout=5.0)
+            except sqlite3.Error as exc2:
+                raise SourceDatabaseError(f"打不开源库 {self.path}：{exc2}") from exc2
         conn.row_factory = sqlite3.Row
         return conn
 

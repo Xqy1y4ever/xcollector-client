@@ -58,6 +58,12 @@ class ExportError(RuntimeError):
     """导出失败。消息里写清"该怎么办"。"""
 
 
+# 收尾"切回 DELETE"的重试次数与间隔：给正在读这个库的连接（页面轮询、另一个实例）
+# 一点让路的时间。合计 ~5 秒；切不动也不当失败（见 `_switch_back_to_delete`）。
+JOURNAL_SWITCH_ATTEMPTS = 5
+JOURNAL_SWITCH_DELAY = 1.0
+
+
 @dataclass
 class ExportReport:
     src: Path
@@ -72,6 +78,9 @@ class ExportReport:
     since_msg_id: dict[str, int] = field(default_factory=dict)
     # 因为"源库看起来换了一份"而整表重导的表
     rebuilt: list[str] = field(default_factory=list)
+    # 收尾那一步"切回 DELETE"没成功（导出库当时还被别人读着）。数据是好的，
+    # 只是这个库暂时停在 WAL 模式上 —— 见 `_switch_back_to_delete()` 的说明。
+    journal_mode_locked: bool = False
     watermark: int = 0
     seconds: float = 0.0
 
@@ -93,13 +102,61 @@ class ExportReport:
             )
         if self.failed_rows:
             parts.append(f"⚠️ {self.failed_rows} 行转换失败（最后一条：{self.last_error}）")
+        if self.journal_mode_locked:
+            parts.append("⚠️ 导出库还被别的连接读着，没能切回 DELETE（下一轮再试）")
         parts.append(f"耗时 {self.seconds:.1f}s")
         return "；".join(parts)
 
 
+def _switch_back_to_delete(conn: sqlite3.Connection, report: ExportReport) -> None:
+    """收尾把导出库切回 DELETE 日志模式；**切不动也不算失败**。
+
+    ## 为什么这一步会"database is locked"
+
+    `PRAGMA journal_mode=DELETE` 需要**独占**：只要有别的连接正开着这个库，
+    SQLite 立刻返回 SQLITE_BUSY —— 而且它**不走 busy_timeout**（这是 journal_mode
+    切换的既定行为，所以 `sqlite3.connect(timeout=60)` 在这里帮不上忙）。
+    真实撞到过的场景（2026-09-19 用户日志）：
+
+        ERROR xcollector.webui | 这一轮失败：导出失败（nt_msg_plain.db → nt_msg_export.db）：
+                                 OperationalError: database is locked
+
+    原因是**本进程的 Web UI 正在轮询状态**（`/api/state` 会读一下导出库算"没读过的"），
+    或者还有**另一个客户端实例**开着。两种情况都不是"数据坏了"。
+
+    ## 所以这里怎么办
+
+    1. 重试几次（给读者让路 —— 页面轮询是亚秒级的）；
+    2. 仍然切不动就**不抛**：数据已经写完了，把它记成 `report.journal_mode_locked`
+       并在日志里说清"常见原因是还有实例开着"，下一轮导出会再试。
+       把它当失败会让一整轮白跑，而用户看到的报错（"database is locked"）
+       指不到真正的原因。
+    3. 万一这个库就一直停在 WAL 模式上也不致命：`SourceDatabase._connect()` 有兜底
+       （只读打不开就退化成普通打开，见那里的说明）。
+    """
+    for attempt in range(1, JOURNAL_SWITCH_ATTEMPTS + 1):
+        try:
+            row = conn.execute("PRAGMA journal_mode=DELETE;").fetchone()
+            mode = str(row[0]).lower() if row else ""
+            if mode == "delete":
+                return
+            logger.warning("导出库切回 DELETE 没成功（现在是 %s），重试 %d/%d",
+                           mode or "未知", attempt, JOURNAL_SWITCH_ATTEMPTS)
+        except sqlite3.OperationalError as exc:
+            logger.warning("导出库正被别的连接占着（%s），重试 %d/%d",
+                           exc, attempt, JOURNAL_SWITCH_ATTEMPTS)
+        time.sleep(JOURNAL_SWITCH_DELAY)
+
+    report.journal_mode_locked = True
+    logger.warning(
+        "导出库没能切回 DELETE（还开着这个库的连接没放）：**数据已经写好了**，这次先这样。"
+        "常见原因是还有另一个客户端实例在跑（它的页面在轮询状态），或者是本进程的页面"
+        "正在刷新 —— 关掉多余的实例即可，下一轮导出会再试一次。"
+    )
+
+
 def _incremental_sql(select_sql: str, since_msg_id: int) -> tuple[str, tuple]:
     """给上游的 SELECT 外面套一层 `msg_id > ?`（`since_msg_id<=0` = 全量）。
-
     **为什么按 msg_id 而不是时间**：`msg_id`（源表的 `"40001"`）是 `INTEGER PRIMARY
     KEY`，也就是 rowid —— 加这个条件是一条**索引区间扫描**，只读新行；而按
     `timestamp >= ?` 要全表扫一遍（实测 77 万行 5.5 秒），而且还有"同秒后到"的
@@ -302,8 +359,9 @@ def export_database(
             else:
                 logger.debug("没有新行：跳过重建 FTS 与收尾检查点")
 
-            # 收尾切回 DELETE：客户端是只读打开导出库的，只读连接建不了 -shm
-            dst_conn.execute("PRAGMA journal_mode=DELETE;")
+            # 收尾切回 DELETE：客户端是**只读**打开导出库的，而 WAL 模式下没有 -shm
+            # 文件就没法只读打开（-shm 是被删过/换过机器之后就没了）。
+            _switch_back_to_delete(dst_conn, report)
     except sqlite3.Error as exc:
         raise ExportError(
             f"导出失败（{src_path.name} → {dst_path.name}）：{type(exc).__name__}: {exc}"

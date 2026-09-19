@@ -236,6 +236,9 @@ function renderState(s) {
       : `<span class="dim">没配白名单：源库里所有来源都读</span>`),
     kv("没读过的", unread == null ? "—"
       : `${unread} 条 <span class="dim">（${scoped ? "只算白名单内" : "全部"}；一轮最多 ${c.max_per_cycle} 条）</span>`),
+    // 跑一轮的时候这两个数先不统计（免得页面轮询和导出抢导出库，见 server.py 的说明）。
+    // 空着不解释会让人以为是坏了，所以把原因写出来（只在这一轮里才有这一行）。
+    ...(s.counts_skipped ? [kv("", `<span class="dim">${esc(s.counts_skipped)}</span>`)] : []),
     kv("镜像库", mir.error ? `<span class="bad">${esc(mir.error)}</span>`
       : `共 ${mir.total ?? 0} 条 · ${esc(JSON.stringify(mir.by_state || {}))}` +
         (mir.unfinished ? ` · <span class="warn">${mir.unfinished} 条没处理完</span>` : "")),

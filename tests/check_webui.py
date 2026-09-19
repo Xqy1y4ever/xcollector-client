@@ -283,6 +283,14 @@ def main() -> int:  # noqa: C901
                 r = c.post(f"{base}/api/mark-unread", headers=ui_headers, json={})
                 check("正在跑 → 409", r.status_code, 409)
                 check_true("说清了为什么", "跑" in r.text, r.text[:140])
+
+                # 正在跑的时候**不去读导出库**：那两个计数要开连接，会撞上导出收尾
+                # 切换日志模式那一步（独占），撞上就是 "database is locked"、整轮白跑。
+                # 空着要说明原因，不能让人以为坏了。
+                ui_server._invalidate_state_cache()   # 不然读到的还是 3 秒前的快照
+                listed = c.get(f"{base}/api/state").json()
+                check("跑的时候不统计「没读过的」", listed.get("unread"), None)
+                check_true("而且写明了原因", bool(listed.get("counts_skipped")), str(listed.get("counts_skipped")))
             finally:
                 ui_server.RUNNER._set(mode="idle", stop_requested=False)
             r = c.get(f"{base}/api/config")

@@ -620,6 +620,44 @@ def test_export() -> None:
         contains="group_msg_table",
     )
 
+    section("导出：导出库正被读着时，收尾那一步不能把整轮搞失败")
+    # 现场（2026-09-19 用户日志）：Web UI 在轮询 /api/state（它会读导出库算"没读过的"），
+    # 正好撞上导出的收尾 `PRAGMA journal_mode=DELETE` —— 那一步要独占，SQLite 直接返回
+    # SQLITE_BUSY 而且**不走 busy_timeout**，于是整轮报"导出失败：database is locked"，
+    # 而数据其实已经写完了。这里直接钉住那个收尾函数的行为。
+    locked_dst = WORK / "exp" / "locked.db"
+    normal = export_database(fixture.plain, locked_dst)
+    check(not normal.journal_mode_locked, "没人抢的时候正常切回 DELETE（不置标记）")
+
+    import app.ntmsg_db.export as export_mod
+
+    conn = sqlite3.connect(str(locked_dst))
+    conn.execute("PRAGMA journal_mode=WAL")
+    holder = sqlite3.connect(str(locked_dst))
+    previous = (export_mod.JOURNAL_SWITCH_ATTEMPTS, export_mod.JOURNAL_SWITCH_DELAY)
+    export_mod.JOURNAL_SWITCH_ATTEMPTS, export_mod.JOURNAL_SWITCH_DELAY = 2, 0.01  # 别让测试等 5 秒
+    try:
+        holder.execute("BEGIN")
+        holder.execute("SELECT count(*) FROM group_messages").fetchone()
+        report_held = export_mod.ExportReport(src=fixture.plain, dst=locked_dst)
+        export_mod._switch_back_to_delete(conn, report_held)      # **不能抛**
+        check(report_held.journal_mode_locked, "reader 占着时：只标记 journal_mode_locked，不抛异常")
+
+        holder.rollback()
+        holder.close()
+        report_free = export_mod.ExportReport(src=fixture.plain, dst=locked_dst)
+        export_mod._switch_back_to_delete(conn, report_free)
+        check(not report_free.journal_mode_locked, "reader 走了之后能切回去（标记为假）")
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        check(str(mode).lower() == "delete", f"确实切成了 DELETE：{mode}")
+    finally:
+        export_mod.JOURNAL_SWITCH_ATTEMPTS, export_mod.JOURNAL_SWITCH_DELAY = previous
+        conn.close()
+        try:
+            holder.close()
+        except Exception:  # noqa: BLE001 - 上面可能已经关过
+            pass
+
 
 # ---------------------------------------------------------------------------
 # 5. 读取器：上游形状的 content 也能读出附件与引用
